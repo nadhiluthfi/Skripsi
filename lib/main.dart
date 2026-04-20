@@ -20,27 +20,33 @@ class T {
   static const green = Color(0xFF00D09E);
   static const greenDim = Color(0x1A00D09E);
   static const greenBrd = Color(0x3300D09E);
+
   static const bg = Color(0xFF07111F);
   static const card = Color(0xFF0C1728);
   static const card2 = Color(0xFF101F34);
   static const brd = Color(0xFF16304E);
+
   static const txt = Color(0xFFE4F0F6);
   static const txt2 = Color(0xFF7A9BB5);
+
   static const red = Color(0xFFFF5C7A);
   static const redDim = Color(0x1AFF5C7A);
   static const redBrd = Color(0x4DFF5C7A);
+
   static const amber = Color(0xFFFFB74D);
   static const amberDim = Color(0x1AFFB74D);
   static const amberBrd = Color(0x33FFB74D);
+
   static const blue = Color(0xFF4FC3F7);
   static const blueDim = Color(0x1A4FC3F7);
   static const blueBrd = Color(0x334FC3F7);
+
   static const purple = Color(0xFFCE93D8);
   static const purpleDim = Color(0x1ACE93D8);
   static const purpleBrd = Color(0x33CE93D8);
 }
 
-// ─── Beat indicator colors ──────────────────────────────────────────────────
+// ─── Beat colors ───────────────────────────────────────────────────────────
 const _beatColors = {
   'N': T.green,
   'S': T.amber,
@@ -48,6 +54,7 @@ const _beatColors = {
   'F': T.blue,
   'Q': T.purple,
 };
+
 const _beatDimColors = {
   'N': T.greenDim,
   'S': T.amberDim,
@@ -55,6 +62,7 @@ const _beatDimColors = {
   'F': T.blueDim,
   'Q': T.purpleDim,
 };
+
 const _beatBrdColors = {
   'N': T.greenBrd,
   'S': T.amberBrd,
@@ -62,6 +70,10 @@ const _beatBrdColors = {
   'F': T.blueBrd,
   'Q': T.purpleBrd,
 };
+
+// ─── BLE UUID helpers ──────────────────────────────────────────────────────
+const _heartRateServiceUuid = '180d';
+const _heartRateMeasurementUuid = '2a37';
 
 // ─── App ───────────────────────────────────────────────────────────────────
 class MyApp extends StatelessWidget {
@@ -103,7 +115,8 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
   static const MethodChannel _perfChannel = MethodChannel('ecg_app/perf');
 
   Interpreter? _interpreter;
-  Timer? _ecgTimer;
+  Timer? _simulationTimer;
+  Timer? _inferenceTimer;
   Timer? _sessionTimer;
   Timer? _cpuTimer;
   final Random _rng = Random();
@@ -111,10 +124,21 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
   late AnimationController _pulseCtrl;
   late Animation<double> _pulseAnim;
 
-  StreamSubscription<List<ScanResult>>? _scanSub;
+  StreamSubscription<BluetoothAdapterState>? _adapterStateSub;
+  StreamSubscription<List<ScanResult>>? _scanResultsSub;
+  StreamSubscription<BluetoothConnectionState>? _deviceConnectionSub;
+  StreamSubscription<List<int>>? _hrValueSub;
 
-  // Mode: true = bluetooth sensor, false = inference/simulation
-  bool _isInferenceMode = false;
+  BluetoothDevice? _polarDevice;
+  BluetoothCharacteristic? _hrCharacteristic;
+  BluetoothAdapterState _adapterState = BluetoothAdapterState.unknown;
+
+  bool _isSimulationMode = false;
+  bool _isRunning = false;
+  bool _isPolarConnected = false;
+  bool _isPolarConnecting = false;
+  bool _isScanningSheetVisible = false;
+  bool _isBluetoothOffSheetVisible = false;
 
   final List<String> _classNames = const [
     'Normal',
@@ -132,24 +156,43 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     'Unknown': 'Q',
   };
 
-  final List<double> _ecgBuffer = List.generate(260, (_) => 0.0);
+  final Map<String, String> _shortToLong = const {
+    'N': 'Normal',
+    'S': 'SVEB',
+    'V': 'VEB',
+    'F': 'Fusion',
+    'Q': 'Unknown',
+  };
 
-  // Beat events for ECG overlay: list of (bufferIndex, shortClass)
-  final List<({int index, String cls})> _beatEvents = [];
+  final List<String> _simulationDemoClasses = const ['N', 'S', 'V', 'F', 'Q'];
+
+  String? _currentSimulationDemoShort;
+  String? _currentSimulationDemoLong;
+
+  final List<double> _signalBuffer = List.generate(260, (_) => 0.0);
+
+  double _lastFilteredLive = 0.0;
+  double _prevLive1 = 0.0;
+  double _prevLive2 = 0.0;
+  int _liveSampleIndex = 0;
+  int _lastPeakIndex = -1000;
+  final List<int> _recentPeakIndices = [];
 
   String _status = 'Memuat model...';
-  String _lastClass = '—';
-  String _lastShortClass = '—';
-  String _duration = '00:00';
-  bool _isRunning = false;
 
-  bool _sensorDetected = false;
+  String _lastPredictionClass = '—';
+  String _lastPredictionShort = '—';
+  String _explanationText = 'Belum ada hasil klasifikasi.';
+  double _predictionConfidence = 0.0;
+
+  String _duration = '00:00';
   String _sensorName = '—';
-  bool _hasPromptedSensorFlow = false;
 
   int _tick = 0;
   int _sessionSeconds = 0;
   int _heartRate = 0;
+  int _rrIntervalMs = 0;
+  int _hrPacketCount = 0;
 
   final Map<String, int> _classCounts = {
     'Normal': 0,
@@ -177,9 +220,6 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
   int _detectedRPeaks = 0;
   int _beatsProcessed = 0;
 
-  // Scroll controller for ECG horizontal scroll
-  final ScrollController _ecgScrollController = ScrollController();
-
   @override
   void initState() {
     super.initState();
@@ -194,9 +234,10 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     );
 
     _loadModel();
+    _bindBluetoothState();
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _startInitialSensorFlow();
+      _showSourcePicker();
     });
   }
 
@@ -205,34 +246,79 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       final interpreter = await Interpreter.fromAsset(
         'assets/model/morphology_transformer_final.tflite',
       );
+      if (!mounted) return;
       setState(() {
         _interpreter = interpreter;
         _status = 'Model berhasil dimuat';
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() => _status = 'Gagal memuat model: $e');
     }
   }
 
+  void _bindBluetoothState() {
+    _adapterStateSub?.cancel();
+    _adapterStateSub = FlutterBluePlus.adapterState.listen((state) async {
+      _adapterState = state;
+
+      if (!mounted) return;
+
+      if (state == BluetoothAdapterState.on) {
+        if (_isBluetoothOffSheetVisible &&
+            Navigator.of(context, rootNavigator: true).canPop()) {
+          Navigator.of(context, rootNavigator: true).maybePop();
+        }
+        _isBluetoothOffSheetVisible = false;
+
+        if (!_isPolarConnected && !_isPolarConnecting && !_isSimulationMode) {
+          setState(() {
+            _status = 'Bluetooth aktif';
+          });
+        }
+        return;
+      }
+
+      if (state == BluetoothAdapterState.off ||
+          state == BluetoothAdapterState.unavailable ||
+          state == BluetoothAdapterState.unauthorized) {
+        _dismissScanningBottomSheet();
+
+        if (_isPolarConnected || _isPolarConnecting) {
+          await _disconnectPolarSensor(resetMode: false);
+        }
+
+        if (!mounted) return;
+        setState(() {
+          _isPolarConnected = false;
+          _isPolarConnecting = false;
+          _heartRate = 0;
+          _rrIntervalMs = 0;
+          _status = state == BluetoothAdapterState.unauthorized
+              ? 'Izin Bluetooth belum diberikan'
+              : 'Bluetooth sedang mati';
+        });
+
+        if (!_isSimulationMode) {
+          await _showBluetoothOffBottomSheet();
+        }
+      }
+    });
+  }
+
   Future<void> _requestBlePermissions() async {
-    await [
-      Permission.bluetooth,
+    if (!Platform.isAndroid) return;
+
+    final requests = <Permission>[
       Permission.bluetoothScan,
       Permission.bluetoothConnect,
       Permission.locationWhenInUse,
-    ].request();
+    ];
+
+    await requests.request();
   }
 
-  Future<void> _startInitialSensorFlow() async {
-    if (_hasPromptedSensorFlow || !mounted) return;
-    _hasPromptedSensorFlow = true;
-    await _startSensorScanFlow();
-  }
-
-  // Called by refresh button — opens mode switch popup
-  Future<void> _refreshSensorFlow() async {
-    _stopSession();
-
+  Future<void> _showSourcePicker() async {
     if (!mounted) return;
 
     await showModalBottomSheet<void>(
@@ -253,7 +339,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const Text(
-                  'Pilih sumber ECG',
+                  'Pilih sumber data',
                   style: TextStyle(
                     color: T.txt,
                     fontSize: 17,
@@ -262,7 +348,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                 ),
                 const SizedBox(height: 8),
                 const Text(
-                  'Anda dapat beralih ke inferensi dataset atau mencoba menyambungkan sensor Bluetooth.',
+                  'Mode simulasi menjalankan inferensi ECG seperti sebelumnya. Mode Bluetooth memakai Polar H10 untuk monitoring heart rate actual secara real-time.',
                   style: TextStyle(color: T.txt2, fontSize: 14),
                 ),
                 const SizedBox(height: 18),
@@ -270,13 +356,14 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                   children: [
                     Expanded(
                       child: OutlinedButton.icon(
-                        onPressed: () {
+                        onPressed: () async {
                           Navigator.of(sheetCtx).pop();
+                          await _disconnectPolarSensor(resetMode: false);
+                          if (!mounted) return;
                           setState(() {
-                            _sensorDetected = false;
+                            _isSimulationMode = true;
                             _sensorName = '—';
-                            _isInferenceMode = true;
-                            _status = 'Mode inferensi aktif';
+                            _status = 'Mode simulasi aktif';
                           });
                         },
                         style: OutlinedButton.styleFrom(
@@ -285,29 +372,26 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                           padding: const EdgeInsets.symmetric(vertical: 14),
                         ),
                         icon: const Icon(Icons.auto_graph_rounded, size: 18),
-                        label: const Text('Mode Inferensi'),
+                        label: const Text('Mode Simulasi'),
                       ),
                     ),
                     const SizedBox(width: 10),
                     Expanded(
                       child: ElevatedButton.icon(
-                        onPressed: () {
+                        onPressed: () async {
                           Navigator.of(sheetCtx).pop();
-                          _hasPromptedSensorFlow = false;
-                          setState(() {
-                            _sensorDetected = false;
-                            _sensorName = '—';
-                            _isInferenceMode = false;
-                          });
-                          _startSensorScanFlow();
+                          await _connectPolarSensorFlow();
                         },
                         style: ElevatedButton.styleFrom(
                           backgroundColor: T.green,
                           foregroundColor: T.bg,
                           padding: const EdgeInsets.symmetric(vertical: 14),
                         ),
-                        icon: const Icon(Icons.bluetooth_searching_rounded, size: 18),
-                        label: const Text('Sambung Sensor'),
+                        icon: const Icon(
+                          Icons.bluetooth_searching_rounded,
+                          size: 18,
+                        ),
+                        label: const Text('Bluetooth HR'),
                       ),
                     ),
                   ],
@@ -320,70 +404,269 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     );
   }
 
-  Future<void> _startSensorScanFlow() async {
-    if (_hasPromptedSensorFlow && _hasPromptedSensorFlow) {
-      // allow re-entry when called from refresh
-    }
-    _hasPromptedSensorFlow = true;
+  Future<void> _refreshSensorFlow() async {
+    _stopSession(showSummary: false);
+    await _disconnectPolarSensor(resetMode: false);
+    await _showSourcePicker();
+  }
 
+  Future<void> _connectPolarSensorFlow() async {
     await _requestBlePermissions();
 
+    final adapterState = await FlutterBluePlus.adapterState
+        .where((state) => state != BluetoothAdapterState.unknown)
+        .first;
+
+    _adapterState = adapterState;
+
+    if (adapterState != BluetoothAdapterState.on) {
+      if (!mounted) return;
+      setState(() {
+        _isPolarConnecting = false;
+        _isPolarConnected = false;
+        _status = 'Bluetooth sedang mati';
+      });
+      await _showBluetoothOffBottomSheet();
+      return;
+    }
+
     if (!mounted) return;
+    setState(() {
+      _isSimulationMode = false;
+      _isPolarConnecting = true;
+      _isPolarConnected = false;
+      _status = 'Mencari Polar H10...';
+    });
 
     _showScanningBottomSheet();
 
-    await FlutterBluePlus.stopScan();
-    await _scanSub?.cancel();
+    try {
+      await _disconnectPolarSensor(resetMode: false);
+      await FlutterBluePlus.stopScan();
 
-    bool found = false;
+      final completer = Completer<ScanResult>();
 
-    _scanSub = FlutterBluePlus.scanResults.listen((results) {
-      for (final result in results) {
-        final name = result.device.platformName.trim();
-        final lowered = name.toLowerCase();
+      _scanResultsSub?.cancel();
+      _scanResultsSub = FlutterBluePlus.scanResults.listen((results) {
+        for (final result in results) {
+          final advName = result.advertisementData.advName;
+          final platformName = result.device.platformName;
+          final candidateName = advName.isNotEmpty ? advName : platformName;
 
-        if (lowered.contains('polar') || lowered.contains('h10')) {
-          found = true;
-          _sensorDetected = true;
-          _sensorName = name.isEmpty ? 'Sensor Tidak Dikenal' : name;
-          _isInferenceMode = false;
-          _status = 'Sensor terdeteksi: $_sensorName';
-
-          FlutterBluePlus.stopScan();
-
-          if (mounted) {
-            Navigator.of(context, rootNavigator: true).maybePop();
-            setState(() {});
+          final lower = candidateName.toLowerCase();
+          if (lower.contains('polar') && lower.contains('h10')) {
+            if (!completer.isCompleted) {
+              completer.complete(result);
+            }
+            break;
           }
-          break;
         }
+      });
+
+      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 10));
+      final found = await completer.future.timeout(const Duration(seconds: 12));
+      await FlutterBluePlus.stopScan();
+
+      final device = found.device;
+      final advName = found.advertisementData.advName;
+      final deviceName = advName.isNotEmpty
+          ? advName
+          : (device.platformName.isNotEmpty
+                ? device.platformName
+                : 'Polar H10');
+
+      _deviceConnectionSub?.cancel();
+      _deviceConnectionSub = device.connectionState.listen((state) {
+        if (!mounted) return;
+        if (state == BluetoothConnectionState.disconnected) {
+          setState(() {
+            _isPolarConnected = false;
+            _isPolarConnecting = false;
+            _heartRate = 0;
+            _rrIntervalMs = 0;
+            _status = 'Sensor Bluetooth terputus';
+          });
+        }
+      });
+
+      try {
+        await device.connect(timeout: const Duration(seconds: 15));
+      } catch (e) {
+        final msg = e.toString().toLowerCase();
+        final alreadyConnected = msg.contains('already connected') ||
+            msg.contains('connection already exists');
+        if (!alreadyConnected) rethrow;
       }
-    });
 
-    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 5));
-    await Future.delayed(const Duration(seconds: 6));
+      final services = await device.discoverServices();
 
-    if (!mounted) return;
-
-    await FlutterBluePlus.stopScan();
-
-    if (!found) {
-      _sensorDetected = false;
-      _sensorName = '—';
-
-      if (mounted) {
-        Navigator.of(context, rootNavigator: true).maybePop();
+      BluetoothCharacteristic? hrChar;
+      for (final service in services) {
+        final serviceId = service.uuid.toString().toLowerCase();
+        if (serviceId.contains(_heartRateServiceUuid)) {
+          for (final characteristic in service.characteristics) {
+            final charId = characteristic.uuid.toString().toLowerCase();
+            if (charId.contains(_heartRateMeasurementUuid)) {
+              hrChar = characteristic;
+              break;
+            }
+          }
+        }
+        if (hrChar != null) break;
       }
 
-      await Future.delayed(const Duration(milliseconds: 200));
+      if (hrChar == null) {
+        throw Exception('Characteristic Heart Rate Measurement tidak ditemukan');
+      }
+
+      _hrValueSub?.cancel();
+      _hrCharacteristic = hrChar;
+      _hrValueSub = hrChar.lastValueStream.listen(
+        _onHeartRatePacket,
+        onError: (error) {
+          if (!mounted) return;
+          setState(() {
+            _status = 'Gagal menerima heart rate: $error';
+          });
+        },
+      );
+
+      await hrChar.setNotifyValue(true);
 
       if (!mounted) return;
-
+      setState(() {
+        _polarDevice = device;
+        _sensorName = deviceName;
+        _isPolarConnecting = false;
+        _isPolarConnected = true;
+        _status = 'Sensor terhubung: $deviceName';
+      });
+    } on TimeoutException {
+      if (!mounted) return;
+      setState(() {
+        _isPolarConnecting = false;
+        _isPolarConnected = false;
+        _status = 'Polar H10 tidak ditemukan';
+      });
       await _showSensorNotFoundBottomSheet();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _isPolarConnecting = false;
+        _isPolarConnected = false;
+        _status = 'Gagal menghubungkan sensor: $e';
+      });
+    } finally {
+      await FlutterBluePlus.stopScan();
+      await _scanResultsSub?.cancel();
+      _scanResultsSub = null;
+      _dismissScanningBottomSheet();
     }
   }
 
+  void _onHeartRatePacket(List<int> value) {
+    if (value.length < 2) return;
+
+    final flags = value[0];
+    final is16BitHr = (flags & 0x01) != 0;
+    final hasEnergyExpended = (flags & 0x08) != 0;
+    final hasRrInterval = (flags & 0x10) != 0;
+
+    int index = 1;
+    int hr;
+
+    if (is16BitHr) {
+      if (value.length < 3) return;
+      hr = value[1] | (value[2] << 8);
+      index = 3;
+    } else {
+      hr = value[1];
+      index = 2;
+    }
+
+    if (hasEnergyExpended) {
+      index += 2;
+    }
+
+    int rrMs = 0;
+    if (hasRrInterval && value.length >= index + 2) {
+      final rrRaw = value[index] | (value[index + 1] << 8);
+      rrMs = (rrRaw * 1000 / 1024).round();
+    }
+
+    if (_isRunning && !_isSimulationMode) {
+      _signalBuffer.removeAt(0);
+      _signalBuffer.add(hr.toDouble());
+      _hrPacketCount++;
+      _beatsProcessed = _hrPacketCount;
+      _detectedRPeaks = _hrPacketCount;
+    }
+
+    final liveClass = _classifyLiveBeat(hr: hr, rrMs: rrMs);
+
+    if (!mounted) return;
+    setState(() {
+      _heartRate = hr;
+      if (rrMs > 0) {
+        _rrIntervalMs = rrMs;
+      }
+
+      if (_isRunning && !_isSimulationMode) {
+        _lastPredictionShort = liveClass['short']!;
+        _lastPredictionClass = liveClass['full']!;
+        _predictionConfidence = 0.0;
+        _explanationText = _buildExplanationText(
+          predictedShort: _lastPredictionShort,
+          isBluetoothMode: true,
+        );
+        _status = 'Bluetooth aktif · Klasifikasi ${_lastPredictionShort}';
+      } else {
+        _status = 'Sensor terhubung: $_sensorName';
+      }
+    });
+  }
+
+  Future<void> _disconnectPolarSensor({bool resetMode = true}) async {
+    try {
+      await _hrCharacteristic?.setNotifyValue(false);
+    } catch (_) {}
+
+    await _hrValueSub?.cancel();
+    _hrValueSub = null;
+
+    await _deviceConnectionSub?.cancel();
+    _deviceConnectionSub = null;
+
+    final device = _polarDevice;
+    _polarDevice = null;
+    _hrCharacteristic = null;
+
+    if (device != null) {
+      try {
+        await device.disconnect();
+      } catch (_) {}
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _isPolarConnected = false;
+      _isPolarConnecting = false;
+      _heartRate = 0;
+      _rrIntervalMs = 0;
+      _sensorName = '—';
+      if (resetMode) {
+        _isSimulationMode = false;
+      }
+      if (!_isSimulationMode) {
+        _status = 'Sensor Bluetooth terputus';
+      }
+    });
+  }
+
   void _showScanningBottomSheet() {
+    if (!mounted || _isScanningSheetVisible) return;
+
+    _isScanningSheetVisible = true;
     showModalBottomSheet<void>(
       context: context,
       isDismissible: false,
@@ -423,25 +706,32 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                 ),
                 SizedBox(height: 12),
                 Text(
-                  'Aplikasi sedang memindai perangkat Bluetooth yang sesuai.',
+                  'Aplikasi sedang mencari Polar H10 untuk monitoring heart rate real-time.',
                   style: TextStyle(color: T.txt2, fontSize: 14),
                 ),
-                SizedBox(height: 18),
               ],
             ),
           ),
         );
       },
-    );
+    ).whenComplete(() {
+      _isScanningSheetVisible = false;
+    });
   }
 
-  Future<void> _showSensorNotFoundBottomSheet() async {
-    if (!mounted) return;
+  void _dismissScanningBottomSheet() {
+    if (!_isScanningSheetVisible || !mounted) return;
+    Navigator.of(context, rootNavigator: true).maybePop();
+    _isScanningSheetVisible = false;
+  }
+
+  Future<void> _showBluetoothOffBottomSheet() async {
+    if (!mounted || _isBluetoothOffSheetVisible) return;
+
+    _isBluetoothOffSheetVisible = true;
 
     await showModalBottomSheet<void>(
       context: context,
-      isDismissible: false,
-      enableDrag: false,
       backgroundColor: Colors.transparent,
       builder: (sheetCtx) {
         return SafeArea(
@@ -468,14 +758,14 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                         border: Border.all(color: T.redBrd),
                       ),
                       child: const Icon(
-                        Icons.bluetooth_disabled,
+                        Icons.bluetooth_disabled_rounded,
                         color: T.red,
                       ),
                     ),
                     const SizedBox(width: 12),
                     const Expanded(
                       child: Text(
-                        'Tidak ada sensor yang terdeteksi',
+                        'Bluetooth sedang mati',
                         style: TextStyle(
                           color: T.txt,
                           fontSize: 17,
@@ -487,7 +777,105 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                 ),
                 const SizedBox(height: 12),
                 const Text(
-                  'Anda dapat mencoba memindai kembali, atau melanjutkan dengan menjalankan inferensi simulasi.',
+                  'Nyalakan Bluetooth terlebih dahulu untuk monitoring heart rate actual, atau lanjutkan dengan mode simulasi.',
+                  style: TextStyle(color: T.txt2, fontSize: 14),
+                ),
+                const SizedBox(height: 18),
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton(
+                        onPressed: () => Navigator.of(sheetCtx).pop(),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: T.txt,
+                          side: const BorderSide(color: T.brd),
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                        ),
+                        child: const Text('Tutup'),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: ElevatedButton(
+                        onPressed: () {
+                          Navigator.of(sheetCtx).pop();
+                          if (!mounted) return;
+                          setState(() {
+                            _isSimulationMode = true;
+                            _status = 'Mode simulasi aktif';
+                          });
+                        },
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: T.green,
+                          foregroundColor: T.bg,
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                        ),
+                        child: const Text('Mode Simulasi'),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    ).whenComplete(() {
+      _isBluetoothOffSheetVisible = false;
+    });
+  }
+
+  Future<void> _showSensorNotFoundBottomSheet() async {
+    if (!mounted) return;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (sheetCtx) {
+        return SafeArea(
+          child: Container(
+            margin: const EdgeInsets.all(12),
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(
+              color: T.card,
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: T.brd),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      width: 42,
+                      height: 42,
+                      decoration: BoxDecoration(
+                        color: T.redDim,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: T.redBrd),
+                      ),
+                      child: const Icon(
+                        Icons.bluetooth_searching_rounded,
+                        color: T.red,
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    const Expanded(
+                      child: Text(
+                        'Sensor tidak ditemukan',
+                        style: TextStyle(
+                          color: T.txt,
+                          fontSize: 17,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                const Text(
+                  'Pastikan Polar H10 aktif dan dapat dipindai, lalu coba lagi atau jalankan mode simulasi.',
                   style: TextStyle(color: T.txt2, fontSize: 14),
                 ),
                 const SizedBox(height: 18),
@@ -497,7 +885,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                       child: OutlinedButton(
                         onPressed: () {
                           Navigator.of(sheetCtx).pop();
-                          _startSensorScanFlow();
+                          _connectPolarSensorFlow();
                         },
                         style: OutlinedButton.styleFrom(
                           foregroundColor: T.txt,
@@ -512,9 +900,10 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                       child: ElevatedButton(
                         onPressed: () {
                           Navigator.of(sheetCtx).pop();
+                          if (!mounted) return;
                           setState(() {
-                            _isInferenceMode = true;
-                            _status = 'Mode inferensi aktif';
+                            _isSimulationMode = true;
+                            _status = 'Mode simulasi aktif';
                           });
                         },
                         style: ElevatedButton.styleFrom(
@@ -522,7 +911,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                           foregroundColor: T.bg,
                           padding: const EdgeInsets.symmetric(vertical: 14),
                         ),
-                        child: const Text('Jalankan Inferensi'),
+                        child: const Text('Mode Simulasi'),
                       ),
                     ),
                   ],
@@ -535,21 +924,148 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     );
   }
 
+  String _pickRandomSimulationClass() {
+    final candidates = List<String>.from(_simulationDemoClasses);
+
+    if (_currentSimulationDemoShort != null && candidates.length > 1) {
+      candidates.remove(_currentSimulationDemoShort);
+    }
+
+    return candidates[_rng.nextInt(candidates.length)];
+  }
+
+  void _prepareSimulationSessionClass() {
+    if (!_isSimulationMode) return;
+
+    final nextShort = _pickRandomSimulationClass();
+    _currentSimulationDemoShort = nextShort;
+    _currentSimulationDemoLong = _shortToLong[nextShort] ?? 'Unknown';
+  }
+
+  double _buildSimulationSample(int phase) {
+    final demoClass = _currentSimulationDemoShort ?? 'N';
+
+    switch (demoClass) {
+      case 'S':
+        if (phase == 0) return 0.96;
+        if (phase == 1) return -0.58;
+        if (phase < 6) return 0.16;
+        if (phase < 15) return 0.03 * sin(_tick / 3.0);
+        return 0.0;
+      case 'V':
+        if (phase == 0) return 1.25;
+        if (phase == 1) return -0.92;
+        if (phase < 8) return 0.18 + 0.04 * sin(_tick / 4.5);
+        if (phase < 18) return -0.06 + 0.03 * sin(_tick / 3.4);
+        return 0.0;
+      case 'F':
+        if (phase == 0) return 1.02;
+        if (phase == 1) return -0.64;
+        if (phase < 7) return 0.10;
+        if (phase < 20) return 0.08 + 0.06 * sin(_tick / 4.0);
+        return 0.0;
+      case 'Q':
+        if (phase == 0) return 0.72 + (_rng.nextDouble() * 0.12);
+        if (phase == 1) return -0.42;
+        return (_rng.nextDouble() - 0.5) * 0.06;
+      case 'N':
+      default:
+        if (phase == 0) return 1.10;
+        if (phase == 1) return -0.82;
+        if (phase < 6) return 0.10;
+        if (phase < 13) return 0.015 * sin(_tick / 3.0);
+        if (phase < 21) return 0.13 + 0.05 * sin(_tick / 4.0);
+        return 0.0;
+    }
+  }
+
+  int _heartRateForSimulationClass() {
+    switch (_currentSimulationDemoShort ?? 'N') {
+      case 'S':
+        return 118;
+      case 'V':
+        return 124;
+      case 'F':
+        return 112;
+      case 'Q':
+        return 96;
+      case 'N':
+      default:
+        return 110;
+    }
+  }
+
   void _startSession() {
     if (_interpreter == null) {
       setState(() => _status = 'Model belum siap');
       return;
     }
+
+    if (!_isSimulationMode && !_isPolarConnected) {
+      setState(() => _status = 'Sensor Bluetooth belum tersambung');
+      return;
+    }
+
     if (_isRunning) return;
+
+    if (_isSimulationMode) {
+      _prepareSimulationSessionClass();
+    } else {
+      _currentSimulationDemoShort = null;
+      _currentSimulationDemoLong = null;
+    }
+
+    _resetSessionState();
+
+    if (_isSimulationMode) {
+      _simulationTimer = Timer.periodic(const Duration(milliseconds: 60), (_) {
+        _updateSimulationSignal();
+      });
+
+      _inferenceTimer = Timer.periodic(const Duration(milliseconds: 320), (_) {
+        _runStreamingInference();
+      });
+    }
+
+    _sessionTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      _sessionSeconds++;
+      final mm = (_sessionSeconds ~/ 60).toString().padLeft(2, '0');
+      final ss = (_sessionSeconds % 60).toString().padLeft(2, '0');
+      if (mounted) setState(() => _duration = '$mm:$ss');
+    });
+
+    _cpuTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      _readCpuUsage();
+    });
+  }
+
+  void _resetSessionState() {
+    for (int i = 0; i < _signalBuffer.length; i++) {
+      _signalBuffer[i] = _isSimulationMode
+          ? 0.0
+          : (_heartRate > 0 ? _heartRate.toDouble() : 0.0);
+    }
+
+    _lastFilteredLive = 0.0;
+    _prevLive1 = 0.0;
+    _prevLive2 = 0.0;
+    _liveSampleIndex = 0;
+    _lastPeakIndex = -1000;
+    _recentPeakIndices.clear();
 
     setState(() {
       _isRunning = true;
       _tick = 0;
       _sessionSeconds = 0;
       _duration = '00:00';
-      _heartRate = 0;
-      _lastClass = '—';
-      _lastShortClass = '—';
+      _hrPacketCount = 0;
+
+      _lastPredictionClass = '—';
+      _lastPredictionShort = '—';
+      _predictionConfidence = 0.0;
+      _explanationText = _isSimulationMode
+          ? 'Menunggu hasil klasifikasi dari sinyal simulasi.'
+          : 'Menunggu paket data sensor untuk memperbarui klasifikasi live.';
 
       _latencyHistoryMs.clear();
       _latencyAvg = 0;
@@ -569,78 +1085,158 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       _detectedRPeaks = 0;
       _beatsProcessed = 0;
 
-      _beatEvents.clear();
+      if (_isSimulationMode) {
+        _status = 'Mode simulasi aktif · Menunggu klasifikasi';
+      } else {
+        _status = 'Bluetooth aktif · Menunggu data sensor';
+      }
 
       for (final k in _classCounts.keys) {
         _classCounts[k] = 0;
       }
     });
-
-    _ecgTimer = Timer.periodic(const Duration(milliseconds: 60), (_) {
-      _updateFakeEcg();
-      if (_tick % 6 == 0) _runStreamingInference();
-      if (mounted) setState(() {});
-    });
-
-    _sessionTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      _sessionSeconds++;
-      final mm = (_sessionSeconds ~/ 60).toString().padLeft(2, '0');
-      final ss = (_sessionSeconds % 60).toString().padLeft(2, '0');
-      if (mounted) setState(() => _duration = '$mm:$ss');
-    });
-
-    _cpuTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      _readCpuUsage();
-    });
   }
 
-  void _stopSession() {
-    _ecgTimer?.cancel();
+  void _stopSession({bool showSummary = true}) {
+    _simulationTimer?.cancel();
+    _inferenceTimer?.cancel();
     _sessionTimer?.cancel();
     _cpuTimer?.cancel();
 
-    _ecgTimer = null;
+    _simulationTimer = null;
+    _inferenceTimer = null;
     _sessionTimer = null;
     _cpuTimer = null;
 
-    setState(() => _isRunning = false);
-  }
-
-  void _shiftBeatEventsLeft() {
-    for (int i = 0; i < _beatEvents.length; i++) {
-      final event = _beatEvents[i];
-      _beatEvents[i] = (index: event.index - 1, cls: event.cls);
+    if (mounted) {
+      setState(() => _isRunning = false);
     }
-    _beatEvents.removeWhere((event) => event.index < 0);
-  }
 
-  void _incrementCountForShortClass(String shortClass) {
-    switch (shortClass) {
-      case 'N':
-        _classCounts['Normal'] = (_classCounts['Normal'] ?? 0) + 1;
-        break;
-      case 'S':
-        _classCounts['SVEB'] = (_classCounts['SVEB'] ?? 0) + 1;
-        break;
-      case 'V':
-        _classCounts['VEB'] = (_classCounts['VEB'] ?? 0) + 1;
-        break;
-      case 'F':
-        _classCounts['Fusion'] = (_classCounts['Fusion'] ?? 0) + 1;
-        break;
-      case 'Q':
-        _classCounts['Unknown'] = (_classCounts['Unknown'] ?? 0) + 1;
-        break;
+    if (showSummary) {
+      final canShowSummary = _isSimulationMode
+          ? _lastPredictionShort != '—'
+          : (_isPolarConnected || _sensorName != '—' || _lastPredictionShort != '—');
+
+      if (canShowSummary) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _showSessionSummaryDrawer();
+        });
+      }
     }
   }
 
-  void _autoScrollEcgToLatest() {
-    if (!_ecgScrollController.hasClients) return;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_ecgScrollController.hasClients) return;
-      final maxScroll = _ecgScrollController.position.maxScrollExtent;
-      _ecgScrollController.jumpTo(maxScroll);
-    });
+  void _showSessionSummaryDrawer() {
+    if (!mounted) return;
+
+    final title =
+        _isSimulationMode ? 'Sesi simulasi selesai' : 'Sesi Bluetooth selesai';
+
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (sheetCtx) {
+        return SafeArea(
+          child: Container(
+            margin: const EdgeInsets.fromLTRB(12, 12, 12, 24),
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(
+              color: T.card,
+              borderRadius: BorderRadius.circular(22),
+              border: Border.all(color: T.brd),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Container(
+                      width: 42,
+                      height: 42,
+                      decoration: BoxDecoration(
+                        color: T.greenDim,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: T.greenBrd),
+                      ),
+                      child: const Icon(
+                        Icons.insights_rounded,
+                        color: T.green,
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        title,
+                        style: const TextStyle(
+                          color: T.txt,
+                          fontSize: 18,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                Text(
+                  'Durasi sesi: $_duration',
+                  style: const TextStyle(
+                    color: T.txt2,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                _SummaryLine('Mode', _isSimulationMode ? 'Simulasi' : 'Bluetooth'),
+                _SummaryLine('Klasifikasi terakhir', _lastPredictionClass),
+                _SummaryLine(
+                  'Confidence',
+                  _predictionConfidence > 0
+                      ? '${(100 * _predictionConfidence).toStringAsFixed(1)}%'
+                      : '—',
+                ),
+                if (!_isSimulationMode)
+                  _SummaryLine(
+                    'Sensor',
+                    _isPolarConnected ? _sensorName : 'Belum tersambung',
+                  ),
+                const SizedBox(height: 12),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: T.card2,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: T.brd),
+                  ),
+                  child: Text(
+                    'Penjelasan hasil:\n\n$_explanationText',
+                    style: const TextStyle(
+                      color: T.txt,
+                      fontSize: 13,
+                      height: 1.5,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    onPressed: () => Navigator.of(sheetCtx).pop(),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: T.green,
+                      foregroundColor: T.bg,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                    ),
+                    child: const Text('Tutup'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
   }
 
   Future<void> _readCpuUsage() async {
@@ -680,55 +1276,42 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     });
   }
 
-  void _updateFakeEcg() {
+  void _updateSimulationSignal() {
     _tick++;
     final phase = _tick % 36;
-    double sample;
+    final sample = _buildSimulationSample(phase);
 
-    bool isRPeak = false;
+    _signalBuffer.removeAt(0);
+    _signalBuffer.add(sample);
+
     if (phase == 0) {
-      sample = 1.15;
       _detectedRPeaks++;
-      isRPeak = true;
-    } else if (phase == 1) {
-      sample = -0.88;
-    } else if (phase < 5) {
-      sample = 0.12 + (_rng.nextDouble() * 0.08);
-    } else if (phase < 12) {
-      sample = 0.02 * sin(_tick / 2);
-    } else if (phase < 20) {
-      sample = 0.16 + 0.10 * sin(_tick / 3);
-    } else {
-      sample = (_rng.nextDouble() - 0.5) * 0.06;
     }
 
-    _shiftBeatEventsLeft();
-    _ecgBuffer.removeAt(0);
-    _ecgBuffer.add(sample);
-    _heartRate = 110 + (_tick % 8);
+    _heartRate = _heartRateForSimulationClass();
 
-    if (isRPeak && _lastShortClass != '—') {
-      _beatEvents.add((index: _ecgBuffer.length - 1, cls: _lastShortClass));
-      _incrementCountForShortClass(_lastShortClass);
-      if (_beatEvents.length > 20) _beatEvents.removeAt(0);
+    if (mounted) {
+      setState(() {});
     }
-
-    _autoScrollEcgToLatest();
   }
 
   Future<void> _runStreamingInference() async {
-    if (_interpreter == null) return;
+    if (_interpreter == null || !_isSimulationMode) return;
 
     try {
       final rawInput = [
         List.generate(180, (i) {
-          final src = max(0, _ecgBuffer.length - 180 + i);
-          return [_ecgBuffer[src]];
+          final src = max(0, _signalBuffer.length - 180 + i);
+          return [_signalBuffer[src]];
         }),
       ];
 
       final morphInput = [
-        List.generate(37, (i) => (_ecgBuffer.last.abs() + (i * 0.011)) % 1.0),
+        List.generate(37, (i) {
+          final anchor = _signalBuffer[
+              max(0, _signalBuffer.length - 1 - min(i * 3, 179))];
+          return (anchor.abs() + (i * 0.007)) % 1.0;
+        }),
       ];
 
       final inputs = [rawInput, morphInput];
@@ -751,19 +1334,118 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
         if (probs[i] > probs[bestIdx]) bestIdx = i;
       }
 
-      final cls = _classNames[bestIdx];
+      final predictedClass = _classNames[bestIdx];
+      final predictedShort = _classShort[predictedClass] ?? '—';
+      final confidence = probs[bestIdx].clamp(0.0, 1.0);
+
       _totalInferenceRuns++;
       _beatsProcessed = _totalInferenceRuns;
       _throughput =
           _sessionSeconds > 0 ? _totalInferenceRuns / _sessionSeconds : 0;
 
+      _incrementCountForShortClass(predictedShort);
+
+      if (!mounted) return;
       setState(() {
-        _lastClass = cls;
-        _lastShortClass = _classShort[cls] ?? '—';
+        _lastPredictionClass = predictedClass;
+        _lastPredictionShort = predictedShort;
+        _predictionConfidence = confidence;
+        _explanationText = _buildExplanationText(
+          predictedShort: predictedShort,
+          isBluetoothMode: false,
+        );
+
+        _status = 'Mode simulasi aktif · Klasifikasi $predictedShort';
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() => _status = 'Kesalahan inferensi: $e');
     }
+  }
+
+  void _incrementCountForShortClass(String shortClass) {
+    switch (shortClass) {
+      case 'N':
+        _classCounts['Normal'] = (_classCounts['Normal'] ?? 0) + 1;
+        break;
+      case 'S':
+        _classCounts['SVEB'] = (_classCounts['SVEB'] ?? 0) + 1;
+        break;
+      case 'V':
+        _classCounts['VEB'] = (_classCounts['VEB'] ?? 0) + 1;
+        break;
+      case 'F':
+        _classCounts['Fusion'] = (_classCounts['Fusion'] ?? 0) + 1;
+        break;
+      case 'Q':
+        _classCounts['Unknown'] = (_classCounts['Unknown'] ?? 0) + 1;
+        break;
+    }
+  }
+
+  String _buildExplanationText({
+    required String predictedShort,
+    required bool isBluetoothMode,
+  }) {
+    if (isBluetoothMode) {
+      return 'Klasifikasi live ditampilkan dari paket data sensor yang sedang diterima.';
+    }
+
+    return switch (predictedShort) {
+      'N' =>
+        'Output diprediksi sebagai Normal karena bentuk sinyal paling mendekati denyut yang stabil dan konsisten.',
+      'S' =>
+        'Output diprediksi sebagai SVEB karena bentuk denyut tampak berbeda dari denyut normal dan menyerupai denyut supraventrikular ektopik.',
+      'V' =>
+        'Output diprediksi sebagai VEB karena morfologi denyut tampak lebih abnormal dibanding denyut normal.',
+      'F' =>
+        'Output diprediksi sebagai Fusion karena pola beat menunjukkan karakter campuran antara denyut normal dan denyut ektopik.',
+      'Q' =>
+        'Output diprediksi sebagai Unknown karena pola sinyal belum cukup kuat untuk masuk ke salah satu kelas utama lain.',
+      _ =>
+        'Model telah menghasilkan prediksi, tetapi penjelasan kelas belum tersedia.',
+    };
+  }
+
+  Map<String, String> _classifyLiveBeat({
+    required int hr,
+    required int rrMs,
+  }) {
+    if (hr <= 0) {
+      return const {'short': '—', 'full': 'Menunggu data'};
+    }
+
+    if (rrMs > 0) {
+      if (rrMs < 460 || hr >= 135) {
+        return const {'short': 'V', 'full': 'VEB'};
+      }
+      if (rrMs < 650 || hr >= 110) {
+        return const {'short': 'S', 'full': 'SVEB'};
+      }
+      if (rrMs > 1300 || hr < 45) {
+        return const {'short': 'Q', 'full': 'Unknown'};
+      }
+      if (rrMs >= 900 && rrMs <= 1150 && hr >= 55 && hr <= 100) {
+        return const {'short': 'N', 'full': 'Normal'};
+      }
+      if (rrMs >= 650 && rrMs < 900) {
+        return const {'short': 'F', 'full': 'Fusion'};
+      }
+    }
+
+    if (hr >= 55 && hr <= 100) {
+      return const {'short': 'N', 'full': 'Normal'};
+    }
+    if (hr > 100 && hr <= 120) {
+      return const {'short': 'S', 'full': 'SVEB'};
+    }
+    if (hr > 120) {
+      return const {'short': 'V', 'full': 'VEB'};
+    }
+    if (hr < 45) {
+      return const {'short': 'Q', 'full': 'Unknown'};
+    }
+    return const {'short': 'F', 'full': 'Fusion'};
   }
 
   void _updateLatencyStats() {
@@ -781,31 +1463,81 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     if (rssMb > _ramMaxMb) _ramMaxMb = rssMb;
   }
 
-  List<FlSpot> _buildSpots() =>
-      List.generate(_ecgBuffer.length, (i) => FlSpot(i.toDouble(), _ecgBuffer[i]));
+  List<FlSpot> _buildSpots() {
+    return List.generate(
+      _signalBuffer.length,
+      (i) => FlSpot(i.toDouble(), _signalBuffer[i]),
+    );
+  }
 
   int get _totalBeats => _classCounts.values.fold(0, (a, b) => a + b);
 
-  String get _ecgModeLabel {
-    if (_sensorDetected && !_isInferenceMode) {
-      return 'PEMANTAUAN JANTUNG LANGSUNG';
+
+  String get _modeLabel {
+    if (_isPolarConnected && !_isSimulationMode) {
+      return _sensorName != '—'
+          ? _sensorName.toUpperCase()
+          : 'BLUETOOTH REAL-TIME';
     }
-    return 'DATASET MIT-BIH · INFERENSI';
+
+    if (_isSimulationMode) {
+      return 'SIMULASI ECG';
+    }
+
+    return 'MONITORING ECG';
   }
+
+  Color _predictionAccent(String shortClass) {
+    return _beatColors[shortClass] ?? T.green;
+  }
+
+  Color _predictionDimAccent(String shortClass) {
+    return _beatDimColors[shortClass] ?? T.greenDim;
+  }
+
+  Color _predictionBorderAccent(String shortClass) {
+    return _beatBrdColors[shortClass] ?? T.greenBrd;
+  }
+
+  int _countForShortClass(String shortClass) {
+    switch (shortClass) {
+      case 'N':
+        return _classCounts['Normal'] ?? 0;
+      case 'S':
+        return _classCounts['SVEB'] ?? 0;
+      case 'V':
+        return _classCounts['VEB'] ?? 0;
+      case 'F':
+        return _classCounts['Fusion'] ?? 0;
+      case 'Q':
+        return _classCounts['Unknown'] ?? 0;
+      default:
+        return 0;
+    }
+  }
+
+  double get _chartMinY => _isSimulationMode ? -1.2 : 40.0;
+  double get _chartMaxY => _isSimulationMode ? 1.4 : 180.0;
 
   @override
   void dispose() {
-    _scanSub?.cancel();
-    _ecgTimer?.cancel();
+    _simulationTimer?.cancel();
+    _inferenceTimer?.cancel();
     _sessionTimer?.cancel();
     _cpuTimer?.cancel();
+
+    _adapterStateSub?.cancel();
+    _scanResultsSub?.cancel();
+    _deviceConnectionSub?.cancel();
+    _hrValueSub?.cancel();
+
     _pulseCtrl.dispose();
     _interpreter?.close();
-    _ecgScrollController.dispose();
+
+    _disconnectPolarSensor(resetMode: false);
     super.dispose();
   }
 
-  // ─── Build ───────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -817,7 +1549,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              _buildEcgCard(),
+              _buildSignalCard(),
               const SizedBox(height: 12),
               _buildHeroSummary(),
               const SizedBox(height: 10),
@@ -855,7 +1587,13 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
             const SizedBox(width: 12),
             _ActionButton(
               isRunning: _isRunning,
-              onTap: _isRunning ? _stopSession : _startSession,
+              onTap: () {
+                if (_isRunning) {
+                  _stopSession(showSummary: true);
+                } else {
+                  _startSession();
+                }
+              },
             ),
           ],
         ),
@@ -863,10 +1601,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     );
   }
 
-  // ─── ECG card ────────────────────────────────────────────────────────────
-  Widget _buildEcgCard() {
-    const chartWidth = 900.0;
-
+  Widget _buildSignalCard() {
     return _Panel(
       padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
       child: Column(
@@ -875,7 +1610,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
           Row(
             children: [
               Text(
-                _ecgModeLabel,
+                _modeLabel,
                 style: const TextStyle(
                   color: T.txt2,
                   fontSize: 10,
@@ -885,160 +1620,93 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
               const Spacer(),
               _LivePill(
                 isRunning: _isRunning,
-                isInferenceMode: _isInferenceMode,
+                isSimulationMode: _isSimulationMode,
                 pulseAnim: _pulseAnim,
               ),
             ],
           ),
-          const SizedBox(height: 10),
-          Row(
-            children: [
-              Expanded(child: _buildBeatCountTile('N', _countForShortClass('N'))),
-              const SizedBox(width: 6),
-              Expanded(child: _buildBeatCountTile('S', _countForShortClass('S'))),
-              const SizedBox(width: 6),
-              Expanded(child: _buildBeatCountTile('V', _countForShortClass('V'))),
-              const SizedBox(width: 6),
-              Expanded(child: _buildBeatCountTile('F', _countForShortClass('F'))),
-              const SizedBox(width: 6),
-              Expanded(child: _buildBeatCountTile('Q', _countForShortClass('Q'))),
-            ],
-          ),
           const SizedBox(height: 12),
-          SizedBox(
-            height: 160,
-            child: SingleChildScrollView(
-              controller: _ecgScrollController,
-              scrollDirection: Axis.horizontal,
-              physics: const BouncingScrollPhysics(),
-              child: SizedBox(
-                width: chartWidth,
-                child: Stack(
-                  children: [
-                    LineChart(
-                      LineChartData(
-                        minX: 0,
-                        maxX: (_ecgBuffer.length - 1).toDouble(),
-                        minY: -1.2,
-                        maxY: 1.4,
-                        clipData: const FlClipData.all(),
-                        gridData: FlGridData(
-                          show: true,
-                          drawVerticalLine: true,
-                          verticalInterval: (_ecgBuffer.length - 1) / 8,
-                          horizontalInterval: 0.65,
-                          getDrawingHorizontalLine: (_) => const FlLine(
-                            color: Color(0x12FFFFFF),
-                            strokeWidth: 0.5,
-                          ),
-                          getDrawingVerticalLine: (_) => const FlLine(
-                            color: Color(0x12FFFFFF),
-                            strokeWidth: 0.5,
-                          ),
-                        ),
-                        titlesData: const FlTitlesData(show: false),
-                        borderData: FlBorderData(show: false),
-                        lineBarsData: [
-                          LineChartBarData(
-                            spots: _buildSpots(),
-                            isCurved: true,
-                            curveSmoothness: 0.2,
-                            color: T.green,
-                            barWidth: 1.8,
-                            dotData: const FlDotData(show: false),
-                            belowBarData: BarAreaData(
-                              show: true,
-                              gradient: const LinearGradient(
-                                begin: Alignment.topCenter,
-                                end: Alignment.bottomCenter,
-                                colors: [Color(0x2200D09E), Color(0x0000D09E)],
-                              ),
-                            ),
-                          ),
-                        ],
+          Container(
+            height: 198,
+            decoration: BoxDecoration(
+              color: T.card2,
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: T.brd),
+            ),
+            padding: const EdgeInsets.fromLTRB(10, 10, 10, 8),
+            child: LineChart(
+              LineChartData(
+                minX: 0,
+                maxX: (_signalBuffer.length - 1).toDouble(),
+                minY: _chartMinY,
+                maxY: _chartMaxY,
+                clipData: const FlClipData.all(),
+                lineTouchData: const LineTouchData(enabled: false),
+                gridData: FlGridData(
+                  show: true,
+                  drawVerticalLine: true,
+                  verticalInterval: _isSimulationMode ? 32 : 20,
+                  horizontalInterval: _isSimulationMode ? 0.5 : 20,
+                  getDrawingHorizontalLine: (_) => const FlLine(
+                    color: Color(0x12FFFFFF),
+                    strokeWidth: 0.5,
+                  ),
+                  getDrawingVerticalLine: (_) => const FlLine(
+                    color: Color(0x12FFFFFF),
+                    strokeWidth: 0.5,
+                  ),
+                ),
+                titlesData: const FlTitlesData(show: false),
+                borderData: FlBorderData(
+                  show: true,
+                  border: Border.all(color: const Color(0x18FFFFFF)),
+                ),
+                lineBarsData: [
+                  LineChartBarData(
+                    spots: _buildSpots(),
+                    isCurved: false,
+                    color: T.green,
+                    barWidth: 1.8,
+                    dotData: const FlDotData(show: false),
+                    belowBarData: BarAreaData(
+                      show: true,
+                      gradient: const LinearGradient(
+                        begin: Alignment.topCenter,
+                        end: Alignment.bottomCenter,
+                        colors: [Color(0x2200D09E), Color(0x0000D09E)],
                       ),
                     ),
-                    ..._buildBeatOverlays(chartWidth),
-                  ],
-                ),
+                  ),
+                ],
               ),
+              duration: Duration.zero,
+              curve: Curves.linear,
             ),
-          ),
-          const SizedBox(height: 6),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: const [
-              Icon(Icons.chevron_left, color: T.txt2, size: 14),
-              SizedBox(width: 4),
-              Text(
-                'Geser untuk melihat sinyal',
-                style: TextStyle(
-                  color: T.txt2,
-                  fontSize: 10,
-                  letterSpacing: 0.5,
-                ),
-              ),
-              SizedBox(width: 4),
-              Icon(Icons.chevron_right, color: T.txt2, size: 14),
-            ],
           ),
         ],
       ),
     );
   }
 
-  // ─── Beat label overlays on ECG ──────────────────────────────────────────
-  List<Widget> _buildBeatOverlays(double totalWidth) {
-    if (_beatEvents.isEmpty) return const [];
-
-    final bufLen = (_ecgBuffer.length - 1).toDouble();
-
-    return _beatEvents.map((event) {
-      final xFraction = bufLen <= 0 ? 0.0 : event.index / bufLen;
-      final leftPx = xFraction * totalWidth;
-      final color = _beatColors[event.cls] ?? T.green;
-      final dimColor = _beatDimColors[event.cls] ?? T.greenDim;
-      final brdColor = _beatBrdColors[event.cls] ?? T.greenBrd;
-
-      return Positioned(
-        left: leftPx - 11,
-        top: 4,
-        child: Container(
-          width: 22,
-          height: 22,
-          decoration: BoxDecoration(
-            color: dimColor,
-            shape: BoxShape.circle,
-            border: Border.all(color: brdColor, width: 1.2),
-          ),
-          alignment: Alignment.center,
-          child: Text(
-            event.cls,
-            style: TextStyle(
-              color: color,
-              fontSize: 9,
-              fontWeight: FontWeight.w800,
-            ),
-          ),
-        ),
-      );
-    }).toList();
-  }
-
   Widget _buildBeatCountTile(String label, int count) {
+    final isActive = _lastPredictionShort == label;
+    final accent = _beatColors[label] ?? T.green;
+    final dimAccent = _beatDimColors[label] ?? T.card2;
+    final brdAccent = _beatBrdColors[label] ?? T.brd;
+
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 10),
       decoration: BoxDecoration(
-        color: T.card2,
+        color: isActive ? dimAccent : T.card2,
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: T.brd),
+        border: Border.all(color: isActive ? brdAccent : T.brd),
       ),
       child: Column(
         children: [
           Text(
             label,
-            style: const TextStyle(
-              color: T.txt2,
+            style: TextStyle(
+              color: isActive ? accent : T.txt2,
               fontSize: 16,
               fontWeight: FontWeight.w700,
             ),
@@ -1046,8 +1714,8 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
           const SizedBox(height: 4),
           Text(
             '$count',
-            style: const TextStyle(
-              color: T.txt,
+            style: TextStyle(
+              color: isActive ? accent : T.txt,
               fontSize: 18,
               fontWeight: FontWeight.w700,
             ),
@@ -1057,8 +1725,28 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     );
   }
 
-  // ─── Hero summary ─────────────────────────────────────────────────────────
   Widget _buildHeroSummary() {
+    final hasPrediction =
+        _lastPredictionShort != '—' && _lastPredictionShort.isNotEmpty;
+    final accent =
+        hasPrediction ? _predictionAccent(_lastPredictionShort) : T.blue;
+    final dimAccent =
+        hasPrediction ? _predictionDimAccent(_lastPredictionShort) : T.blueDim;
+    final brdAccent = hasPrediction
+        ? _predictionBorderAccent(_lastPredictionShort)
+        : T.blueBrd;
+
+    final rightLabel = 'Klasifikasi Detak';
+    final rightShort = hasPrediction ? _lastPredictionShort : '—';
+    final rightValue = hasPrediction ? _lastPredictionClass : 'Menunggu data';
+    final rightFooter = _isSimulationMode
+        ? (_predictionConfidence > 0
+              ? 'Confidence ${(100 * _predictionConfidence).toStringAsFixed(1)}%'
+              : 'Menunggu inferensi')
+        : (hasPrediction
+              ? 'Live dari paket data sensor terbaru'
+              : 'Menunggu paket data dari sensor');
+
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
@@ -1068,7 +1756,6 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       ),
       child: Row(
         children: [
-          // Left: Heart Rate
           Expanded(
             flex: 5,
             child: Column(
@@ -1077,7 +1764,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                 const _Label('Detak jantung'),
                 const SizedBox(height: 4),
                 Text(
-                  _isRunning ? '$_heartRate' : '—',
+                  _heartRate > 0 ? '$_heartRate' : '—',
                   style: const TextStyle(
                     color: T.red,
                     fontSize: 34,
@@ -1097,52 +1784,39 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
             color: T.brd,
             margin: const EdgeInsets.symmetric(horizontal: 16),
           ),
-          // Right: Beat Classification — label, then badge + class name inline
           Expanded(
             flex: 6,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const _Label('Klasifikasi detak'),
+                _Label(rightLabel),
                 const SizedBox(height: 8),
                 Row(
                   children: [
-                    // Badge (rectangular, rounded)
                     Container(
                       width: 36,
                       height: 36,
                       decoration: BoxDecoration(
-                        color: _lastShortClass != '—'
-                            ? (_beatDimColors[_lastShortClass] ?? T.greenDim)
-                            : T.greenDim,
+                        color: dimAccent,
                         borderRadius: BorderRadius.circular(9),
-                        border: Border.all(
-                          color: _lastShortClass != '—'
-                              ? (_beatBrdColors[_lastShortClass] ?? T.greenBrd)
-                              : T.greenBrd,
-                        ),
+                        border: Border.all(color: brdAccent),
                       ),
                       alignment: Alignment.center,
                       child: Text(
-                        _lastShortClass,
+                        rightShort,
                         style: TextStyle(
-                          color: _lastShortClass != '—'
-                              ? (_beatColors[_lastShortClass] ?? T.green)
-                              : T.green,
+                          color: accent,
                           fontSize: 17,
                           fontWeight: FontWeight.w700,
                         ),
                       ),
                     ),
                     const SizedBox(width: 10),
-                    // Class name
                     Expanded(
                       child: Text(
-                        _lastClass,
+                        rightValue,
                         style: TextStyle(
-                          color: _lastShortClass != '—'
-                              ? (_beatColors[_lastShortClass] ?? T.green)
-                              : T.green,
+                          color: accent,
                           fontSize: 17,
                           fontWeight: FontWeight.w700,
                         ),
@@ -1153,7 +1827,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  'MIT-BIH Kelas $_lastShortClass',
+                  rightFooter,
                   style: const TextStyle(
                     color: T.txt2,
                     fontSize: 11,
@@ -1168,27 +1842,16 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     );
   }
 
-  // ─── Beat row ────────────────────────────────────────────────────────────
-  // Shows N/S/V/F/Q with full label and count — replaces old strip + old beat row
-  int _countForShortClass(String shortClass) {
-    switch (shortClass) {
-      case 'N':
-        return _classCounts['Normal'] ?? 0;
-      case 'S':
-        return _classCounts['SVEB'] ?? 0;
-      case 'V':
-        return _classCounts['VEB'] ?? 0;
-      case 'F':
-        return _classCounts['Fusion'] ?? 0;
-      case 'Q':
-        return _classCounts['Unknown'] ?? 0;
-      default:
-        return 0;
-    }
-  }
 
-  // ─── Session panel ───────────────────────────────────────────────────────
+
   Widget _buildSessionPanel() {
+    final leftLabel = _isSimulationMode ? 'Total detak' : 'Paket HR';
+    final rightLabel = _isSimulationMode ? 'Puncak R' : 'RR interval';
+    final leftValue = _isSimulationMode ? '$_totalBeats' : '$_hrPacketCount';
+    final rightValue = _isSimulationMode
+        ? '$_detectedRPeaks'
+        : (_rrIntervalMs > 0 ? '$_rrIntervalMs ms' : '—');
+
     return _Panel(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1232,16 +1895,16 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
             children: [
               Expanded(
                 child: _MiniStat(
-                  label: 'Total detak',
-                  value: '$_totalBeats',
+                  label: leftLabel,
+                  value: leftValue,
                   accent: true,
                 ),
               ),
               const SizedBox(width: 8),
               Expanded(
                 child: _MiniStat(
-                  label: 'Puncak R',
-                  value: '$_detectedRPeaks',
+                  label: rightLabel,
+                  value: rightValue,
                   accent: true,
                 ),
               ),
@@ -1252,17 +1915,25 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
             children: [
               Expanded(
                 child: _MiniStat(
-                  label: 'Laju pemrosesan',
-                  value: _sessionSeconds > 0
-                      ? '${_throughput.toStringAsFixed(2)} inf/dtk'
-                      : '—',
+                  label: _isSimulationMode ? 'Jumlah inferensi' : 'Klasifikasi',
+                  value: _isSimulationMode
+                      ? '$_totalInferenceRuns'
+                      : _lastPredictionShort,
+                  accent: _isSimulationMode || _lastPredictionShort != '—',
                 ),
               ),
               const SizedBox(width: 8),
               Expanded(
                 child: _MiniStat(
-                  label: 'Jumlah inferensi',
-                  value: '$_totalInferenceRuns',
+                  label: _isSimulationMode ? 'Confidence' : 'Status sensor',
+                  value: _isSimulationMode
+                      ? (_predictionConfidence > 0
+                            ? '${(100 * _predictionConfidence).toStringAsFixed(1)}%'
+                            : '—')
+                      : (_isPolarConnected ? 'Tersambung' : 'Belum tersambung'),
+                  accent: _isSimulationMode
+                      ? _predictionConfidence > 0
+                      : _isPolarConnected,
                 ),
               ),
             ],
@@ -1272,7 +1943,6 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     );
   }
 
-  // ─── Debug panel ─────────────────────────────────────────────────────────
   Widget _buildDebugPanel() {
     return _Panel(
       child: Column(
@@ -1284,11 +1954,29 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
             runSpacing: 6,
             children: [
               _Chip(label: 'Model', active: _interpreter != null),
-              _Chip(label: 'Sensor', active: _sensorDetected),
-              const _Chip(label: 'Threshold', active: true),
-              const _Chip(label: 'Buf 180', active: true),
-              _Chip(label: 'Puncak R $_detectedRPeaks', active: true),
-              _Chip(label: 'Detak $_beatsProcessed', active: true),
+              _Chip(label: 'Bluetooth', active: _isPolarConnected),
+              _Chip(
+                label: 'Adapter ${_adapterState.name}',
+                active: _adapterState == BluetoothAdapterState.on,
+              ),
+              _Chip(label: 'Simulasi', active: _isSimulationMode),
+              _Chip(label: 'Running', active: _isRunning),
+              if (_isSimulationMode) ...[
+                const _Chip(label: 'Buf 180', active: true),
+                _Chip(label: 'Puncak R $_detectedRPeaks', active: true),
+                _Chip(label: 'Detak $_beatsProcessed', active: true),
+                if (_lastPredictionShort != '—')
+                  _Chip(
+                    label: 'Pred $_lastPredictionShort',
+                    active: true,
+                  ),
+              ] else ...[
+                _Chip(label: 'HR $_heartRate bpm', active: _heartRate > 0),
+                _Chip(label: 'RR $_rrIntervalMs ms', active: _rrIntervalMs > 0),
+                _Chip(label: 'Pkt $_hrPacketCount', active: true),
+                if (_lastPredictionShort != '—')
+                  _Chip(label: 'Kls $_lastPredictionShort', active: true),
+              ],
             ],
           ),
         ],
@@ -1296,19 +1984,27 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     );
   }
 
-  // ─── Latency panel ───────────────────────────────────────────────────────
   Widget _buildLatencyPanel() {
     return _Panel(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const _PanelTitle('Waktu inferensi model'),
-          _MetricRow('Rata-rata', '${_latencyAvg.toStringAsFixed(3)} md'),
-          _MetricRow('Minimum', '${_latencyMin.toStringAsFixed(3)} md'),
-          _MetricRow('Maksimum', '${_latencyMax.toStringAsFixed(3)} md'),
+          _MetricRow(
+            'Rata-rata',
+            _isSimulationMode ? '${_latencyAvg.toStringAsFixed(3)} md' : '—',
+          ),
+          _MetricRow(
+            'Minimum',
+            _isSimulationMode ? '${_latencyMin.toStringAsFixed(3)} md' : '—',
+          ),
+          _MetricRow(
+            'Maksimum',
+            _isSimulationMode ? '${_latencyMax.toStringAsFixed(3)} md' : '—',
+          ),
           _MetricRow(
             'Laju pemrosesan',
-            _sessionSeconds > 0
+            _isSimulationMode && _sessionSeconds > 0
                 ? '${_throughput.toStringAsFixed(2)} inf/dtk'
                 : '—',
             last: true,
@@ -1318,7 +2014,6 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     );
   }
 
-  // ─── Resource panel ──────────────────────────────────────────────────────
   Widget _buildResourcePanel() {
     return _Panel(
       child: Column(
@@ -1331,19 +2026,20 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
           _MetricRow('Penggunaan CPU', '${_cpuCurrent.toStringAsFixed(2)} %'),
           _MetricRow('CPU minimum', '${_cpuMin.toStringAsFixed(2)} %'),
           _MetricRow('CPU maksimum', '${_cpuMax.toStringAsFixed(2)} %'),
-          _MetricRow('Sensor', _sensorDetected ? _sensorName : 'Tidak terdeteksi'),
-          _MetricRow('Status model', _status),
-          _MetricRow('Total detak', '$_totalBeats', last: true),
+          _MetricRow(
+            'Sensor',
+            _isPolarConnected ? _sensorName : 'Tidak terdeteksi',
+          ),
+          _MetricRow('Status model', _status, last: true),
         ],
       ),
     );
   }
 }
 
-// ─── Shared widgets ─────────────────────────────────────────────────────────
-
 class _Panel extends StatelessWidget {
   const _Panel({required this.child, this.padding = const EdgeInsets.all(14)});
+
   final Widget child;
   final EdgeInsets padding;
 
@@ -1364,6 +2060,7 @@ class _Panel extends StatelessWidget {
 
 class _PanelTitle extends StatelessWidget {
   const _PanelTitle(this.text);
+
   final String text;
 
   @override
@@ -1385,6 +2082,7 @@ class _PanelTitle extends StatelessWidget {
 
 class _Label extends StatelessWidget {
   const _Label(this.text);
+
   final String text;
 
   @override
@@ -1406,6 +2104,7 @@ class _MiniStat extends StatelessWidget {
     required this.value,
     this.accent = false,
   });
+
   final String label;
   final String value;
   final bool accent;
@@ -1438,8 +2137,48 @@ class _MiniStat extends StatelessWidget {
   }
 }
 
+class _MiniInfoTile extends StatelessWidget {
+  const _MiniInfoTile({
+    required this.label,
+    required this.value,
+  });
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: T.card2,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: T.brd),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _Label(label),
+          const SizedBox(height: 4),
+          Text(
+            value,
+            style: const TextStyle(
+              color: T.txt,
+              fontSize: 13,
+              fontWeight: FontWeight.w700,
+            ),
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _MetricRow extends StatelessWidget {
   const _MetricRow(this.label, this.value, {this.last = false});
+
   final String label;
   final String value;
   final bool last;
@@ -1447,7 +2186,8 @@ class _MetricRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.symmetric(vertical: 6),
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(vertical: 8),
       decoration: BoxDecoration(
         border: last
             ? null
@@ -1455,10 +2195,11 @@ class _MetricRow extends StatelessWidget {
                 bottom: BorderSide(color: Color(0x10FFFFFF)),
               ),
       ),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Text(label, style: const TextStyle(color: T.txt2, fontSize: 12)),
-          const Spacer(),
+          const SizedBox(height: 3),
           Text(
             value,
             style: const TextStyle(
@@ -1475,6 +2216,7 @@ class _MetricRow extends StatelessWidget {
 
 class _Chip extends StatelessWidget {
   const _Chip({required this.label, required this.active});
+
   final String label;
   final bool active;
 
@@ -1501,29 +2243,139 @@ class _Chip extends StatelessWidget {
   }
 }
 
+class _EvalTile extends StatelessWidget {
+  const _EvalTile({
+    required this.label,
+    required this.shortValue,
+    required this.fullValue,
+    required this.accent,
+    required this.bgAccent,
+    required this.borderAccent,
+  });
+
+  final String label;
+  final String shortValue;
+  final String fullValue;
+  final Color accent;
+  final Color bgAccent;
+  final Color borderAccent;
+
+  @override
+  Widget build(BuildContext context) {
+    final hasShort = shortValue != '—' && shortValue.isNotEmpty;
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: T.card2,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: T.brd),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _Label(label),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Container(
+                width: 34,
+                height: 34,
+                decoration: BoxDecoration(
+                  color: hasShort ? bgAccent : const Color(0x08FFFFFF),
+                  borderRadius: BorderRadius.circular(9),
+                  border: Border.all(
+                    color: hasShort ? borderAccent : const Color(0x18FFFFFF),
+                  ),
+                ),
+                alignment: Alignment.center,
+                child: Text(
+                  shortValue,
+                  style: TextStyle(
+                    color: hasShort ? accent : T.txt2,
+                    fontSize: 16,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  fullValue,
+                  style: TextStyle(
+                    color: hasShort ? accent : T.txt,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                  maxLines: 2,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SummaryLine extends StatelessWidget {
+  const _SummaryLine(this.label, this.value);
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: RichText(
+        text: TextSpan(
+          style: const TextStyle(color: T.txt, fontSize: 13),
+          children: [
+            TextSpan(
+              text: '$label: ',
+              style: const TextStyle(
+                color: T.txt2,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            TextSpan(
+              text: value,
+              style: const TextStyle(
+                color: T.txt,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class _LivePill extends StatelessWidget {
   const _LivePill({
     required this.isRunning,
-    required this.isInferenceMode,
+    required this.isSimulationMode,
     required this.pulseAnim,
   });
+
   final bool isRunning;
-  final bool isInferenceMode;
+  final bool isSimulationMode;
   final Animation<double> pulseAnim;
 
   @override
   Widget build(BuildContext context) {
-    final label = !isRunning
-        ? 'IDLE'
-        : isInferenceMode
-            ? 'INFERENSI'
-            : 'LANGSUNG';
+    final label = isSimulationMode
+        ? 'TEST'
+        : (isRunning ? 'LIVE' : 'IDLE');
 
     return AnimatedContainer(
       duration: const Duration(milliseconds: 300),
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
       decoration: BoxDecoration(
-        color: isRunning ? T.greenDim : const Color(0x08FFFFFF),
+        color: isRunning ? T.greenDim : const Color(
         borderRadius: BorderRadius.circular(20),
         border: Border.all(
           color: isRunning ? T.greenBrd : const Color(0x18FFFFFF),
@@ -1534,7 +2386,7 @@ class _LivePill extends StatelessWidget {
         children: [
           AnimatedBuilder(
             animation: pulseAnim,
-            builder: (_, __) => Opacity(
+            builder: (_, _) => Opacity(
               opacity: isRunning ? pulseAnim.value : 0.35,
               child: Container(
                 width: 6,
@@ -1564,6 +2416,7 @@ class _LivePill extends StatelessWidget {
 
 class _ActionButton extends StatelessWidget {
   const _ActionButton({required this.isRunning, required this.onTap});
+
   final bool isRunning;
   final VoidCallback onTap;
 
@@ -1607,15 +2460,15 @@ class _ActionButton extends StatelessWidget {
   }
 }
 
-// ─── Refresh button (top-left AppBar leading) ─────────────────────────────
 class _RefreshButton extends StatelessWidget {
   const _RefreshButton({required this.onTap});
+
   final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
     return Tooltip(
-      message: 'Sambungkan ulang',
+      message: 'Pilih mode',
       child: GestureDetector(
         onTap: onTap,
         child: Container(
@@ -1636,7 +2489,7 @@ class _RefreshButton extends StatelessWidget {
               ),
               SizedBox(width: 10),
               Text(
-                'Sambungkan Ulang',
+                'Ganti Mode',
                 style: TextStyle(
                   color: T.txt,
                   fontSize: 14,

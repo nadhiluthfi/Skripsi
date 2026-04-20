@@ -1,0 +1,257 @@
+package com.polar.polarsensordatacollector.ui.trainingsession
+
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import androidx.compose.foundation.layout.*
+import androidx.compose.material.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.DataObject
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Alignment.Companion.CenterHorizontally
+import androidx.compose.ui.Alignment.Companion.CenterVertically
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.core.net.toUri
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.viewModels
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.fragment.findNavController
+import androidx.navigation.fragment.navArgs
+import com.google.gson.GsonBuilder
+import com.google.gson.JsonPrimitive
+import com.google.gson.JsonSerializer
+import com.polar.polarsensordatacollector.R
+import com.polar.polarsensordatacollector.ui.activity.openDataTextView
+import com.polar.polarsensordatacollector.ui.theme.PolarsensordatacollectorTheme
+import com.polar.polarsensordatacollector.ui.utils.DataLoadProgress
+import com.polar.polarsensordatacollector.ui.utils.DataLoadProgressIndicator
+import com.polar.polarsensordatacollector.ui.utils.FileUtils
+import com.polar.polarsensordatacollector.ui.utils.JsonUtils
+import com.polar.sdk.api.model.trainingsession.PolarTrainingSessionProgress
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.launch
+import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+
+@AndroidEntryPoint
+class TrainingSessionDataFragment : Fragment() {
+    private val viewModel: TrainingSessionDataViewModel by viewModels()
+    private lateinit var deviceId: String
+    private lateinit var sessionPath: String
+    private val args: TrainingSessionDataFragmentArgs by navArgs()
+
+    override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
+        deviceId = args.deviceIdFragmentArgument
+        sessionPath = args.trainingSessionPathFragmentArgument
+
+        viewLifecycleOwner.lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.devConnectionState.collect {
+                    if (!it.isConnected) {
+                        val navigateActionToHome = TrainingSessionDataFragmentDirections.trainingSessionDataToHome()
+                        findNavController().navigate(navigateActionToHome)
+                    }
+                }
+            }
+        }
+
+        return ComposeView(requireContext()).apply {
+            setContent {
+                PolarsensordatacollectorTheme {
+                    Surface {
+                        ShowTrainingSessionData(
+                            viewModel = viewModel,
+                            sessionPath = sessionPath
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ShowTrainingSessionData(
+    viewModel: TrainingSessionDataViewModel = viewModel(),
+    sessionPath: String
+) {
+    when (val uiState = viewModel.trainingSessionDataUiState) {
+        is TrainingSessionDataUiState.FetchedData -> {
+            val context = LocalContext.current
+            val gson = GsonBuilder()
+                .registerTypeAdapter(LocalDate::class.java, JsonSerializer<LocalDate> { src, _, _ ->
+                    JsonPrimitive(src?.format(DateTimeFormatter.ISO_LOCAL_DATE))
+                })
+                .registerTypeAdapter(LocalDateTime::class.java, JsonSerializer<LocalDateTime> { src, _, _ ->
+                    JsonPrimitive(src?.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME))
+                })
+                .setPrettyPrinting()
+                .create()
+            val jsonData = JsonUtils.cleanProtoJson(gson.toJson(uiState.data), gson)
+
+            val fileUri = FileUtils(context).saveToFile(
+                jsonData.encodeToByteArray(),
+                "/TRAINING_SESSION/${uiState.data.reference.date}-training-session.json"
+            )
+
+            val intent = Intent().apply {
+                action = Intent.ACTION_SEND
+                type = "application/json"
+                putExtra(Intent.EXTRA_STREAM, fileUri)
+                putExtra(Intent.EXTRA_SUBJECT, stringResource(R.string.polar_training_session))
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+
+            ShowData(
+                onShare = { context.startActivity(Intent.createChooser(intent, "Share Training Session")) },
+                uiState,
+                fileUri,
+                context
+            )
+        }
+        TrainingSessionDataUiState.IsFetching -> ShowIsLoading(null, sessionPath)
+        is TrainingSessionDataUiState.Fetching -> ShowIsLoading(uiState.progress, sessionPath)
+        is TrainingSessionDataUiState.Failure -> {
+            ShowFailed(uiState)
+        }
+    }
+}
+
+@Composable
+fun ShowIsLoading(progress: PolarTrainingSessionProgress?, sessionPath: String) {
+    DataLoadProgressIndicator(
+        progress = progress?.let {
+            DataLoadProgress(
+                completedBytes = it.completedBytes,
+                totalBytes = it.totalBytes,
+                progressPercent = it.progressPercent,
+                path = sessionPath
+            )
+        },
+        dataType = "Training Session"
+    )
+}
+
+@Composable
+fun ShowData(
+    onShare: () -> Unit,
+    trainingSession: TrainingSessionDataUiState.FetchedData,
+    fileUri: Uri,
+    context: Context?
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp)
+    ) {
+        Text(text = stringResource(R.string.path), style = MaterialTheme.typography.h6)
+        Text(
+            text = fileUri.path ?: "",
+            modifier = Modifier.padding(8.dp)
+        )
+
+        Text(text = stringResource(R.string.start_time), style = MaterialTheme.typography.h6)
+        Row(
+            modifier = Modifier.padding(8.dp)
+        ) {
+            Text(text = trainingSession.data.reference.date.toString())
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Row(modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.Center) {
+            Button(
+                onClick = { onShare() },
+                colors = ButtonDefaults.buttonColors(backgroundColor = Color.Blue),
+                contentPadding = PaddingValues(
+                    start = 20.dp,
+                    top = 12.dp,
+                    end = 20.dp,
+                    bottom = 12.dp
+                ),
+                modifier = Modifier.align(CenterVertically)
+            ) {
+                Icon(
+                    Icons.Filled.Share,
+                    contentDescription = stringResource(R.string.share),
+                    modifier = Modifier.size(ButtonDefaults.IconSize)
+                )
+                Spacer(Modifier.size(ButtonDefaults.IconSpacing))
+                Text("Share")
+            }
+
+            Spacer(modifier = Modifier.width(16.dp))
+
+            Button(
+                onClick = {
+                    if (context != null) {
+                        openDataTextView(context, fileUri)
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(backgroundColor = Color.Blue),
+                contentPadding = PaddingValues(
+                    start = 20.dp,
+                    top = 12.dp,
+                    end = 20.dp,
+                    bottom = 12.dp
+                ),
+                modifier = Modifier.align(CenterVertically)
+            ) {
+                Icon(
+                    Icons.Filled.DataObject,
+                    contentDescription = context?.getString(R.string.activity_data_view),
+                    modifier = Modifier.size(ButtonDefaults.IconSize)
+                )
+                Spacer(Modifier.size(ButtonDefaults.IconSpacing))
+                if (context != null) {
+                    Text(context.getString(R.string.activity_data_view) )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ShowFailed(failure: TrainingSessionDataUiState.Failure) {
+    Box(
+        Modifier
+            .fillMaxSize()
+            .padding(10.dp)
+    ) {
+        Column(modifier = Modifier.align(Alignment.Center)) {
+            Column(
+                horizontalAlignment = CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(5.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Filled.Warning, "warning", tint = Color.Yellow)
+                Text(text = failure.message, color = Color.Red, textAlign = TextAlign.Center)
+
+                if (failure.throwable != null) {
+                    Column {
+                        Text(text = stringResource(R.string.details))
+                        Text(text = "${failure.throwable}")
+                    }
+                }
+            }
+        }
+    }
+}

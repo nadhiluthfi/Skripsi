@@ -1,0 +1,231 @@
+///  Copyright © 2024 Polar. All rights reserved.
+
+import Foundation
+import SwiftUI
+import PolarBleSdk
+
+struct ActivityRecordingDetailsView: View {
+    @EnvironmentObject var bleSdkManager: PolarBleSdkManager
+    @State var showingShareSheet: Bool = false
+    @State var showingContents: Bool = false
+    @Binding var isPresented: Bool
+    @State private var toast: String? = nil
+    
+    private let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+    
+    var body: some View {
+        VStack {
+#if targetEnvironment(macCatalyst)
+            Spacer()
+#endif
+            ZStack {
+                switch bleSdkManager.activityRecordingData.loadingState {
+                case let .failed(error):
+                    VStack {
+                        Image(systemName: "exclamationmark.triangle")
+                            .imageScale(.large)
+                            .foregroundColor(.red)
+                        
+                        Text("\(error)")
+                            .foregroundColor(.red)
+                    }
+                case .inProgress:
+                    Color.white.opacity(1.0).edgesIgnoringSafeArea(.all)
+                    ProgressView("Fetching \(String(describing: bleSdkManager.activityRecordingData.activityType)) data...")
+                        .progressViewStyle(CircularProgressViewStyle(tint: .accentColor))
+                case .success:
+                    ScrollView {
+                        VStack(alignment: .leading) {
+                            Group{
+                                Text("ActivityType")
+                                    .font(.headline)
+                                HStack {
+                                    Text("\(String(describing: bleSdkManager.activityRecordingData.activityType))")
+                                    
+                                }.foregroundColor(.secondary)
+                            }
+                            
+                            Group {
+                                Text("Start date")
+                                    .font(.headline)
+                                HStack {
+                                    Text(dateFormatter.string(from: bleSdkManager.activityRecordingData.startDate))
+                                }.foregroundColor(.secondary)
+                                
+                                Text("End date")
+                                    .font(.headline)
+                                HStack {
+                                    Text(dateFormatter.string(from: bleSdkManager.activityRecordingData.endDate))
+                                }
+                                .foregroundColor(.secondary)
+                                
+                                Divider()
+                                
+                                HStack {
+                                    Spacer()
+                                    
+                                    Button(action: {
+                                        self.showingShareSheet = true
+                                    }) {
+                                        Image(systemName: "square.and.arrow.up")
+                                            .foregroundColor(.blue)
+                                            .imageScale(.large)
+                                        Text("Share")
+                                    }.sheet(isPresented: $showingShareSheet) {
+                                        let filename = activityDetailsTitle(for: bleSdkManager.activityRecordingData)
+
+                                        ActivityView(text: bleSdkManager.activityRecordingData.data, filename: "\(filename).json")
+                                    }
+                                    
+                                    Spacer()
+                                    Button(action: {
+                                        self.showingContents = true
+                                    }) {
+                                        Image(systemName: "text.viewfinder")
+                                            .foregroundColor(.blue)
+                                            .imageScale(.large)
+                                        Text("Show")
+                                    }
+                                    .sheet(isPresented: $showingContents) {
+                                        NavigationView {
+                                            let title = activityDetailsTitle(for: bleSdkManager.activityRecordingData)
+                                            let data = bleSdkManager.activityRecordingData.data
+                                            TextViewerView(
+                                                title: title,
+                                                text: prettyPrintedJson(data)
+                                            )
+                                            .toolbar {
+                                                ToolbarItem(placement: .navigationBarTrailing) {
+                                                    Button(action: {
+                                                        self.showingContents = false
+                                                    }) {
+                                                        Image(systemName: "xmark.circle.fill")
+                                                            .foregroundColor(.blue)
+                                                    }.accessibility(identifier: "Close \(title)")
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Spacer()
+                                }
+                            }
+                        }
+                        .padding()
+                    }
+                    .overlay(alignment: .bottom) {
+                        if bleSdkManager.elapsedTimeToast != nil {
+                            Text(bleSdkManager.elapsedTimeToast ?? "")
+                                .padding(.horizontal, 14).padding(.vertical, 10)
+                                .background(.ultraThinMaterial, in: Capsule())
+                                .transition(.opacity.combined(with: .move(edge: .bottom)))
+                                .padding(.bottom, 24)
+                                .onAppear {
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+                                        withAnimation { bleSdkManager.elapsedTimeToast = nil }
+                                    }
+                                }
+                        }
+                    }
+                    .animation(.easeInOut, value: toast)
+                }
+            }
+#if targetEnvironment(macCatalyst)
+            Spacer()
+            Button("Close", action: {
+                isPresented = false
+            })
+            .padding(.bottom)
+            .padding(.top)
+#endif
+        }
+    }
+
+    private func activityDetailsTitle(for activityRecordingData: ActivityRecordingData) -> String {
+        let dateString = dateFormatter.string(from: activityRecordingData.startDate)
+            .elementsEqual(dateFormatter.string(from: activityRecordingData.endDate)) ? dateFormatter.string(from: activityRecordingData.startDate) : "\(dateFormatter.string(from: activityRecordingData.startDate))-\(dateFormatter.string(from: activityRecordingData.endDate))"
+        return "\(activityRecordingData.activityType)_\(dateString)"
+    }
+    
+    private func prettyPrintedJson(_ string: String) -> String {
+        do {
+            let data = string.data(using: .utf8)!
+            let json = try JSONSerialization.jsonObject(with: data, options: [])
+            let prettyData = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted])
+            return String(data: prettyData, encoding: .utf8) ?? string
+        } catch {
+            return string
+        }
+    }
+}
+
+struct ActivityRecordingShareView: UIViewControllerRepresentable {
+    let text: String
+    
+    func makeUIViewController(context: UIViewControllerRepresentableContext<ActivityRecordingShareView>) -> UIActivityViewController {
+        return UIActivityViewController(activityItems: [text], applicationActivities: nil)
+    }
+    
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: UIViewControllerRepresentableContext<ActivityRecordingShareView>) {}
+}
+
+struct ActivityRecordingDetailsView_Previews: PreviewProvider {
+    
+    private static let activityRecordingData = ActivityRecordingData(
+        loadingState: ActivityRecordingDataLoadingState.success,
+        startDate: Date.now,
+        endDate: Date.now,
+        activityType: PolarActivityDataType.NONE,
+        data: "test data"
+    )
+    
+    private static let polarBleSdkManager: PolarBleSdkManager = {
+        let polarBleSdkManager = PolarBleSdkManager()
+        polarBleSdkManager.activityRecordingData = activityRecordingData
+        return polarBleSdkManager
+    }()
+    
+    private static let polarBleSdkManagerInProgress: PolarBleSdkManager = {
+        let polarBleSdkManager = PolarBleSdkManager()
+        polarBleSdkManager.activityRecordingData = 
+        ActivityRecordingData(loadingState: ActivityRecordingDataLoadingState.inProgress)
+        return polarBleSdkManager
+    }()
+    
+    private static let polarBleSdkManagerFailed: PolarBleSdkManager = {
+        let polarBleSdkManager = PolarBleSdkManager()
+        polarBleSdkManager.activityRecordingData
+        = ActivityRecordingData(loadingState: ActivityRecordingDataLoadingState.failed(error: "Failed"))
+        return polarBleSdkManager
+    }()
+    
+    private static let activityRecordingDetails = ActivityRecordingData(
+        startDate: Date(),
+        endDate: Date(),
+        activityType: PolarActivityDataType.NONE,
+        data: "test data"
+    )
+    
+    static var previews: some View {
+        
+        Group {
+            
+            Group {
+                ActivityRecordingDetailsView(isPresented: .constant(true))
+                    .environmentObject(polarBleSdkManager)
+                
+                ActivityRecordingDetailsView(isPresented: .constant(true))
+                    .environmentObject(polarBleSdkManagerInProgress)
+                    .previewDisplayName("InProgress")
+                
+                ActivityRecordingDetailsView(isPresented: .constant(true))
+                    .environmentObject(polarBleSdkManagerFailed)
+                    .previewDisplayName("Failed")
+            }
+        }
+    }
+}
+

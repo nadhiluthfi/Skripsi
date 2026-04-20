@@ -1,0 +1,40 @@
+buildscript {
+    ext.kotlin_version = '2.1.20'
+    ext.ksp_version = '2.1.20-1.0.32'
+    repositories {
+        mavenCentral()
+        google()
+        maven {
+            url "https://plugins.gradle.org/m2/"
+        }
+    }
+
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.7.3'
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+        classpath "org.jetbrains.kotlin:compose-compiler-gradle-plugin:$kotlin_version"
+        classpath "com.google.devtools.ksp:symbol-processing-gradle-plugin:$ksp_version"
+        classpath 'com.google.dagger:hilt-android-gradle-plugin:2.55'
+        classpath "androidx.navigation:navigation-safe-args-gradle-plugin:2.5.3"
+        classpath "com.google.gms:google-services:4.4.3"
+        classpath "com.google.firebase:firebase-appdistribution-gradle:5.1.1"
+        classpath "com.google.firebase:firebase-crashlytics-gradle:3.0.2"
+        classpath "com.google.protobuf:protobuf-gradle-plugin:0.9.6"
+
+        if (project.hasProperty("artifactoryUser") && project.hasProperty("artifactoryPassword")) {
+            classpath "org.jfrog.buildinfo:build-info-extractor-gradle:4.28.1"
+        }
+    }
+}
+
+allprojects {
+    repositories {
+        mavenCentral()
+        google()
+        maven { url 'https://jitpack.io' }
+    }
+}
+
+task clean(type: Delete) {
+    delete rootProject.buildDir
+}

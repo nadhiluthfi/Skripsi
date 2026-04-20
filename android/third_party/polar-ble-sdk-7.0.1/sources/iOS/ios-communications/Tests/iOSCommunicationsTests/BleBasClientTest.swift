@@ -1,0 +1,338 @@
+//  Copyright © 2021 Polar. All rights reserved.
+
+import XCTest
+@testable import iOSCommunications
+import CoreBluetooth
+import RxTest
+import RxSwift
+
+class BleBasClientTest: XCTestCase {
+    var scheduler: TestScheduler!
+    var disposeBag: DisposeBag!
+    var bleBasClient:BleBasClient!
+    var mockGattServiceTransmitterImpl:MockGattServiceTransmitterImpl!
+    
+    override func setUpWithError() throws {
+        scheduler = TestScheduler(initialClock: 0)
+        disposeBag = DisposeBag()
+        mockGattServiceTransmitterImpl = MockGattServiceTransmitterImpl()
+        bleBasClient = BleBasClient(gattServiceTransmitter: mockGattServiceTransmitterImpl)
+    }
+    
+    override func tearDownWithError() throws {
+        scheduler = nil
+        disposeBag = nil
+        mockGattServiceTransmitterImpl = nil
+        bleBasClient = nil
+    }
+    
+    // GIVEN that BLE Battery Service client receives battery data updates
+    // WHEN battery level observable is subscribed
+    // THEN the latest cached battery value is emitted
+    func testTheCachedValue() throws {
+        
+        // Arrange
+        let characteristic: CBUUID = CBUUID(string: "2A19")
+        let deviceNotifyingBatteryData1 = Data([100])
+        let deviceNotifyingBatteryData2 = Data([80])
+        let error = 0
+        let observer = scheduler.createObserver(Int.self)
+        
+        // Act
+        bleBasClient.processServiceData(characteristic, data: deviceNotifyingBatteryData1, err: error)
+        bleBasClient.processServiceData(characteristic, data: deviceNotifyingBatteryData2, err: error)
+        
+        let observable = bleBasClient.monitorBatteryStatus(true)
+        observable.subscribe(observer).disposed(by: disposeBag)
+        
+        scheduler.start()
+        
+        // Assert
+        XCTAssertEqual(observer.events, [
+            .next(0, Int(deviceNotifyingBatteryData2[0]))
+        ])
+    }
+    
+    // GIVEN that BLE Battery Service client receives battery data updates
+    // WHEN battery level observable is subscribed
+    // THEN the correct values are received by observer
+    func testBatteryValuesStreamEmitsCorrectValues() throws {
+        
+        // Arrange
+        let characteristic: CBUUID = CBUUID(string: "2A19")
+        let deviceNotifyingValidBatteryData1 = Data([100])
+        let deviceNotifyingInvalidBatteryData1 = Data([250])
+        let deviceNotifyingValidBatteryData2 = Data([80])
+        let deviceNotifyingInvalidBatteryData2 = Data([0xFF])
+        let deviceNotifyingValidBatteryData3 = Data([00])
+        
+        let error = 0
+        let observer = scheduler.createObserver(Int.self)
+        
+        // Act
+        bleBasClient.processServiceData(characteristic, data: deviceNotifyingValidBatteryData1, err: error)
+        let observable = bleBasClient.monitorBatteryStatus(true)
+        observable.subscribe(observer).disposed(by: disposeBag)
+        scheduler.start()
+        
+        bleBasClient.processServiceData(characteristic, data: deviceNotifyingInvalidBatteryData1, err: error)
+        bleBasClient.processServiceData(characteristic, data: deviceNotifyingValidBatteryData2, err: error)
+        bleBasClient.processServiceData(characteristic, data: deviceNotifyingInvalidBatteryData2, err: error)
+        bleBasClient.processServiceData(characteristic, data: deviceNotifyingValidBatteryData3, err: error)
+        
+        // Assert
+        XCTAssertEqual(observer.events, [
+            .next(0, Int(deviceNotifyingValidBatteryData1[0])),
+            .next(0, Int(deviceNotifyingValidBatteryData2[0])),
+            .next(0, Int(deviceNotifyingValidBatteryData3[0]))
+        ])
+    }
+    
+    // GIVEN that BLE Battery Service client receives battery data updates
+    // WHEN battery level observable is subscribed
+    // THEN at some point device connection is lost
+    func testDeviceDisconnectsWhileStreaming() throws {
+        
+        // Arrange
+        let characteristic: CBUUID = CBUUID(string: "2A19")
+        let deviceNotifyingBatteryData1 = Data([100])
+        let deviceNotifyingBatteryData2 = Data([90])
+        let deviceNotifyingBatteryData3 = Data([80])
+        
+        let error = 0
+        let observer = scheduler.createObserver(Int.self)
+        
+        // Act
+        let observable = bleBasClient.monitorBatteryStatus(true)
+        observable.subscribe(observer).disposed(by: disposeBag)
+        scheduler.start()
+        
+        bleBasClient.processServiceData(characteristic, data: deviceNotifyingBatteryData1, err: error)
+        bleBasClient.processServiceData(characteristic, data: deviceNotifyingBatteryData2, err: error)
+        bleBasClient.processServiceData(characteristic, data: deviceNotifyingBatteryData3, err: error)
+        bleBasClient.disconnected()
+        
+        // Assert
+        XCTAssertEqual(observer.events, [
+            .next(0, Int(deviceNotifyingBatteryData1[0])),
+            .next(0, Int(deviceNotifyingBatteryData2[0])),
+            .next(0, Int(deviceNotifyingBatteryData3[0])),
+            .error(0, BleGattException.gattDisconnected)
+        ])
+    }
+    
+    func testProcessServiceData_ShouldEmitUnknownChargeState() throws {
+        // Arrange
+        let characteristic: CBUUID = BleBasClient.BATTERY_STATUS_CHARACTERISTIC
+        let status = 0
+        let batteryStatusData = Data([0b00000000, 0b00000000])
+        
+        // Act
+        let observer = scheduler.createObserver(BleBasClient.ChargeState.self)
+        bleBasClient.monitorChargingStatus(true)
+            .subscribe(observer)
+            .disposed(by: disposeBag)
+        
+        bleBasClient.processServiceData(characteristic, data: batteryStatusData, err: status)
+        
+        // Assert
+        let events = observer.events.map { $0.value.element }
+        XCTAssertEqual(events[1], BleBasClient.ChargeState.unknown)
+    }
+    
+    func testProcessServiceData_ShouldEmitDischargingInactiveChargeState() throws {
+        // Arrange
+        let characteristic: CBUUID = BleBasClient.BATTERY_STATUS_CHARACTERISTIC
+        let status = 0
+        let batteryStatusData = Data([0x00, 0b11100011])
+        
+        // Act
+        let observer = scheduler.createObserver(BleBasClient.ChargeState.self)
+        bleBasClient.monitorChargingStatus(true)
+            .subscribe(observer)
+            .disposed(by: disposeBag)
+        
+        bleBasClient.processServiceData(characteristic, data: batteryStatusData, err: status)
+        
+        // Assert
+        let events = observer.events.map { $0.value.element }
+        XCTAssertEqual(events[1], BleBasClient.ChargeState.dischargingInactive)
+    }
+    
+    func testProcessServiceData_ShouldEmitDischargingActiveChargeState() throws {
+        // Arrange
+        let characteristic: CBUUID = BleBasClient.BATTERY_STATUS_CHARACTERISTIC
+        let status = 0
+        let batteryStatusData = Data([0x00, 0b11000001])
+        
+        // Act
+        let observer = scheduler.createObserver(BleBasClient.ChargeState.self)
+        bleBasClient.monitorChargingStatus(true)
+            .subscribe(observer)
+            .disposed(by: disposeBag)
+        
+        bleBasClient.processServiceData(characteristic, data: batteryStatusData, err: status)
+        
+        // Assert
+        let events = observer.events.map { $0.value.element }
+        XCTAssertEqual(events[1], BleBasClient.ChargeState.dischargingActive)
+    }
+    
+    func testProcessServiceData_ShouldEmitChargingChargeState() throws {
+        // Arrange
+        let characteristic: CBUUID = BleBasClient.BATTERY_STATUS_CHARACTERISTIC
+        let status = 0
+        let batteryStatusData = Data([0x00, 0b10100011])
+        
+        // Act
+        let observer = scheduler.createObserver(BleBasClient.ChargeState.self)
+        bleBasClient.monitorChargingStatus(true)
+            .subscribe(observer)
+            .disposed(by: disposeBag)
+        
+        bleBasClient.processServiceData(characteristic, data: batteryStatusData, err: status)
+        
+        // Assert
+        let events = observer.events.map { $0.value.element }
+        XCTAssertEqual(events[1], BleBasClient.ChargeState.charging)
+    }
+    
+    // GIVEN that BLE Battery Service client receives battery power sources status updates
+    // WHEN battery power sources status observable is subscribed
+    // THEN the latest cached power sources status value is emitted
+    func testPowerSourcesCachedValue() throws {
+        
+        // Arrange
+        let characteristic: CBUUID = BleBasClient.BATTERY_STATUS_CHARACTERISTIC
+        let batteryStatusDataWiredNotConnected = Data([0x00, 0b10100001])
+        let batteryStatusDataWiredConnected    = Data([0x00, 0b10100011])
+        
+        let error = 0
+        let observer = scheduler.createObserver(BleBasClient.PowerSourcesState.self)
+        
+        // Act
+        bleBasClient.processServiceData(characteristic, data: batteryStatusDataWiredConnected, err: error)
+        bleBasClient.processServiceData(characteristic, data: batteryStatusDataWiredNotConnected, err: error)
+        
+        let observable = bleBasClient.monitorPowerSourcesState(true)
+        observable.subscribe(observer).disposed(by: disposeBag)
+        
+        // Assert
+        let events = observer.events.map { $0.value.element }
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(events[0]?.wiredExternalPowerConnected, BleBasClient.PowerSourceState.notConnected)
+    }
+    
+    func testProcessServiceData_ShouldEmitAllPowerSourceStatesCorrectly() throws {
+        // Arrange
+        let characteristic: CBUUID = BleBasClient.BATTERY_STATUS_CHARACTERISTIC
+        let status = 0
+        let batteryStatusDataBatteryNotPresent              = Data([0x00, 0b10100000])
+        let batteryStatusDataBatteryPresent                 = Data([0x00, 0b10100001])
+        
+        let batteryStatusDataWiredNotConnected              = Data([0x00, 0b10100001])
+        let batteryStatusDataWiredConnected                 = Data([0x00, 0b10100011])
+        let batteryStatusDataWiredUnknown                   = Data([0x00, 0b10100101])
+        let batteryStatusDataWiredReservedForFutureUse      = Data([0x00, 0b10100111])
+        
+        let batteryStatusDataWirelessNotConnected           = Data([0x00, 0b10100011])
+        let batteryStatusDataWirelessConnected              = Data([0x00, 0b10101011])
+        let batteryStatusDataWirelessUnknown                = Data([0x00, 0b10110011])
+        let batteryStatusDataWirelessReservedForFutureUse   = Data([0x00, 0b10111011])
+        
+        // Act
+        let observer = scheduler.createObserver(BleBasClient.PowerSourcesState.self)
+        bleBasClient.monitorPowerSourcesState(true)
+            .subscribe(observer)
+            .disposed(by: disposeBag)
+        
+        bleBasClient.processServiceData(characteristic, data: batteryStatusDataBatteryNotPresent, err: status)
+        bleBasClient.processServiceData(characteristic, data: batteryStatusDataBatteryPresent, err: status)
+        
+        bleBasClient.processServiceData(characteristic, data: batteryStatusDataWiredNotConnected, err: status)
+        bleBasClient.processServiceData(characteristic, data: batteryStatusDataWiredConnected, err: status)
+        bleBasClient.processServiceData(characteristic, data: batteryStatusDataWiredUnknown, err: status)
+        bleBasClient.processServiceData(characteristic, data: batteryStatusDataWiredReservedForFutureUse, err: status)
+        
+        bleBasClient.processServiceData(characteristic, data: batteryStatusDataWirelessNotConnected, err: status)
+        bleBasClient.processServiceData(characteristic, data: batteryStatusDataWirelessConnected, err: status)
+        bleBasClient.processServiceData(characteristic, data: batteryStatusDataWirelessUnknown, err: status)
+        bleBasClient.processServiceData(characteristic, data: batteryStatusDataWirelessReservedForFutureUse, err: status)
+ 
+        // Assert
+        let events = observer.events.map { $0.value.element }
+        XCTAssertEqual(events[1]?.batteryPresent, BleBasClient.BatteryPresentState.notPresent)
+        XCTAssertEqual(events[2]?.batteryPresent, BleBasClient.BatteryPresentState.present)
+
+        XCTAssertEqual(events[3]?.wiredExternalPowerConnected, BleBasClient.PowerSourceState.notConnected)
+        XCTAssertEqual(events[4]?.wiredExternalPowerConnected, BleBasClient.PowerSourceState.connected)
+        XCTAssertEqual(events[5]?.wiredExternalPowerConnected, BleBasClient.PowerSourceState.unknown)
+        XCTAssertEqual(events[6]?.wiredExternalPowerConnected, BleBasClient.PowerSourceState.reservedForFutureUse)
+
+        XCTAssertEqual(events[7]?.wirelessExternalPowerConnected, BleBasClient.PowerSourceState.notConnected)
+        XCTAssertEqual(events[8]?.wirelessExternalPowerConnected, BleBasClient.PowerSourceState.connected)
+        XCTAssertEqual(events[9]?.wirelessExternalPowerConnected, BleBasClient.PowerSourceState.unknown)
+        XCTAssertEqual(events[10]?.wirelessExternalPowerConnected, BleBasClient.PowerSourceState.reservedForFutureUse)
+
+    }
+    
+    func testGetBatteryLevel_should_return_newest_battery_level_value() throws {
+        
+        // Arrange
+        let characteristic: CBUUID = CBUUID(string: "2A19")
+        let deviceNotifyingBatteryData = Data([50])
+        let deviceNotifyingBatteryData2 = Data([100])
+        let error = 0
+        
+        // Act
+        bleBasClient.processServiceData(characteristic, data: deviceNotifyingBatteryData, err: error)
+        bleBasClient.processServiceData(characteristic, data: deviceNotifyingBatteryData2, err: error)
+        let result = bleBasClient.getBatteryLevel()
+        
+        // Assert
+        XCTAssertEqual(result, Int(deviceNotifyingBatteryData2[0]))
+    }
+    
+    func testGetBatteryLevel_should_return_undefined_battery_percentage() throws {
+        
+        // Arrange
+        let characteristic: CBUUID = CBUUID(string: "91A2")
+        
+        // Act
+        bleBasClient.processServiceData(characteristic, data: Data(), err: 0)
+        let result = bleBasClient.getBatteryLevel()
+        
+        // Assert
+        XCTAssertEqual(result, -1)
+    }
+
+    func testGetChargerStatus_should_return_newest_charger_status() throws {
+
+        // Arrange
+        let characteristic: CBUUID = BleBasClient.BATTERY_STATUS_CHARACTERISTIC
+        let status = 0
+        let batteryStatusDataWiredConnected = Data([0x00, 0b10100011])
+
+        // Act
+        bleBasClient.processServiceData(characteristic, data: batteryStatusDataWiredConnected, err: status)
+        let result = bleBasClient.getChargeState()
+
+        // Assert
+        XCTAssertEqual(result, BleBasClient.ChargeState.charging)
+    }
+
+    func testGetChargerStatus_should_return_undefined_battery_percentage() throws {
+
+        // Arrange
+        let characteristic: CBUUID = CBUUID(string: "91A2")
+        let batteryStatusDataWiredConnected = Data([0x00, 0b10100011])
+        let status = 0
+
+        // Act
+        bleBasClient.processServiceData(characteristic, data: batteryStatusDataWiredConnected, err: status)
+        let result = bleBasClient.getChargeState()
+
+        // Assert
+        XCTAssertEqual(result, BleBasClient.ChargeState.unknown)
+    }
+}

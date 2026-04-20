@@ -1,0 +1,383 @@
+<resources>
+    <string name="app_name">PSDC</string>
+    <string name="start_streaming">Start streaming</string>
+    <string name="stop_streaming">Stop streaming</string>
+    <string name="start_offline_recording">Start offline recording</string>
+    <string name="search">Search</string>
+    <string name="filter_by_name_prefix">Filter by name prefix</string>
+    <string name="device_settings_header">Settings</string>
+    <string name="ok_button">OK</string>
+    <string name="stop_button">Stop</string>
+    <string name="set">Set</string>
+    <string name="submit">Submit</string>
+    <string name="settings">Settings</string>
+    <string name="sdk_mode_header">SDK mode</string>
+    <string name="sdk_mode_led_header">SDK mode LED animation</string>
+    <string name="ppi_mode_led_header">PPI mode LED animation</string>
+    <string name="device_to_host_notifications_header">Device to host notifications</string>
+    <string name="stream_settings_header">Data selection and settings</string>
+    <string name="menu_settings">Settings</string>
+    <string name="menu_about">About</string>
+    <string name="title_activity_settings">Settings</string>
+    <string name="do_physical_config_header">Do physical config</string>
+    <string name="do_restart_header">Do restart</string>
+    <string name="get_ftu_header">Get FTU status</string>
+    <string name="do_file_delete_header">Delete files</string>
+    <string name="do_date_folder_delete_header">Delete date folders</string>
+    <string name="do_date_folder_delete_button">Select dates to delete folders</string>
+    <string name="do_telemetry_delete_header">Delete telemetry data</string>
+    <string name="confirm_telemetry_data_delete">Confirm telemetry data delete</string>
+    <string name="delete_button">Delete</string>
+    <string name="set_warehouse_sleep_button_header">Set warehouse sleep</string>
+    <string name="set_warehouse_sleep_switch_header">Enable?</string>
+    <string name="set_turn_device_off_header">Turn device off</string>
+    <string name="ohr_logging_enable">Enable OHR logging</string>
+    <string name="ohr_logging_disable">Disable OHR logging</string>
+    <string name="ppi_logging_enable">Enable PPi logging</string>
+    <string name="ppi_logging_disable">Disable PPi logging</string>
+    <string name="acc_logging_enable">Enable ACC logging</string>
+    <string name="acc_logging_disable">Disable ACC logging</string>
+    <string name="skin_temp_logging_enable">Enable Skin Temperature logging</string>
+    <string name="skin_temp_logging_disable">Disable Skin Temperature logging</string>
+    <string name="calories_logging_enable">Enable Calories logging</string>
+    <string name="calories_logging_disable">Disable Calories logging</string>
+    <string name="met_logging_enable">Enable Metabolic Equivalent logging</string>
+    <string name="met_logging_disable">Disable Metabolic Equivalent logging</string>
+    <string name="sleep_logging_enable">Enable Sleep logging</string>
+    <string name="sleep_logging_disable">Disable Sleep logging</string>
+    <string name="fetch_errorlog">Fetch errorlog</string>
+    <string name="errorlog_exported_mail_subject">Errorlog exported with PSDC</string>
+    <string name="errorlog_exported_mail_text">Hello,\n Errorlog exported as an attachment</string>
+    <string name="choose_email_app">Choose email app</string>
+    <string name="device_id">Device Id: %1$s</string>
+    <string name="activity_rec_picker_header">Choose measurement type</string>
+    <string name="sleep_data">Sleep data</string>
+    <string name="steps_data">Steps data</string>
+    <string name="calories_data">Calories data</string>
+    <string name="hr_247_samples">24/7 HR samples</string>
+    <string name="nightly_recharge">Nightly recharge data</string>
+    <string name="ppi_247_samples">24/7 PPi samples</string>
+    <string name="active_time">Active time data</string>
+    <string name="activity_recording_button_text">Get</string>
+    <string name="activity_calories_button_text">Get</string>
+    <string name="skin_temperature_button_text">Skin temperature data</string>
+    <string name="file_attached_mail_text">Hello,\n see file attachment</string>
+    <string name="force_stop_sleep_header">Stop sleep recording</string>
+    <string name="ll_api_header">Low level API functions</string>
+
+    <!-- Exercise activity -->
+    <string name="title_activity_exercise_activity">Exercise activity</string>
+    <string name="set_exercise_button_header">Start Exercise</string>
+    <string name="set_exercise_header">Exercise</string>
+
+    <string name="exercise_title">Exercise</string>
+    <string name="exercise_title_running">Exercise: %1$s</string>
+    <string name="exercise_connecting">Connecting...</string>
+    <string name="exercise_in_progress">In progress</string>
+    <string name="exercise_paused">Paused</string>
+    <string name="exercise_syncing">Syncing...</string>
+    <string name="exercise_idle">No active exercise</string>
+    <string name="action_pause">Pause</string>
+    <string name="action_resume">Resume</string>
+    <string name="action_stop">Stop</string>
+
+    <string name="toast_starting">Starting…</string>
+    <string name="toast_pausing">Pausing…</string>
+    <string name="toast_resuming">Resuming…</string>
+    <string name="toast_stopping">Stopping…</string>
+    <string name="toast_no_device">No device connected</string>
+    <string name="toast_controlling">Controlling device %1$s</string>
+    <string name="toast_notif_disabled">Notifications disabled – status not shown</string>
+    <string name="toast_data_viewer_failed">Failed to load data from file</string>
+
+    <string name="label_sport">Sport</string>
+    <string name="btn_start">Start</string>
+    <string name="btn_pause">Pause</string>
+    <string name="btn_resume">Resume</string>
+    <string name="btn_stop">Stop</string>
+
+    <string name="status_not_started">Not started</string>
+    <string name="status_in_progress">In progress (%1$s)</string>
+    <string name="status_paused">Paused (%1$s)</string>
+    <string name="status_stopped">Stopped (%1$s)</string>
+    <string name="status_sync_required">Sync required</string>
+
+    <string name="exercise_start_time">Exercise start time: %1$s</string>
+
+    <string name="observe_exercise_state_button">Observe exercise state notifications</string>
+    <string name="stop_observing_button">Stop observing</string>
+
+    <!-- Phone bluetooth status -->
+    <string name="phone_ble_on">Phone Bluetooth on</string>
+    <string name="phone_ble_off">Phone Bluetooth off</string>
+
+    <!-- Search and connect button -->
+    <string name="search_and_connect_search">Search</string>
+    <string name="search_and_connect_connecting">Connecting</string>
+    <string name="search_and_connect_connections">Connections</string>
+    <string name="search_and_connect_disconnect">Disconnect</string>
+    <string name="search_and_connect_disconnecting">Disconnecting...</string>
+
+    <!-- Preference Titles -->
+    <string name="storage_header">Storage</string>
+
+    <!-- Storage Preferences -->
+    <string name="storage_title">Backup location</string>
+
+    <!-- Sync Preferences -->
+    <string name="stream_file_destination_title">Back up online stream files</string>
+    <string name="stream_file_destination_summary_on">Save online stream files on phone storage</string>
+    <string name="stream_file_destination_summary_off">No online stream files back up</string>
+    <string name="ext_storage_prefs_summary_not_set">Not set</string>
+
+    <!-- Physical config activity-->
+    <string name="title_activity_physical_config">PhysicalDataConfig</string>
+    <string name="submit_physical_button">Submit</string>
+    <string name="birthday_hint">Select Birthday</string>
+    <string name="typical_day">Typical day</string>
+    <string name="sleep_goal">Sleep goal</string>
+    <string name="hours_label">Hours:</string>
+    <string name="minutes_label">Minutes:</string>
+
+    <!-- Physical config activity-->
+    <string name="title_delete_data">PhysicalDataConfig</string>
+    <string name="submit_delete_button">Submit</string>
+    <string name="delete_until_date_hint">Select until date</string>
+    <string name="ftu_dialog_title">User physical information</string>
+    <string name="ftu_gender">Gender: %1$s</string>
+    <string name="ftu_birthdate">Birthdate: %1$s</string>
+    <string name="ftu_height">Height: %1$f cm</string>
+    <string name="ftu_weight">Weight: %1$f kg</string>
+    <string name="ftu_max_hr">Max HR: %1$d bpm</string>
+    <string name="ftu_vo2max">VO₂ Max: %1$d ml/kg/min</string>
+    <string name="ftu_resting_hr">Resting HR: %1$d bpm</string>
+    <string name="ftu_training_background">Training background: %1$s</string>
+    <string name="ftu_typical_day">Typical day: %1$s</string>
+    <string name="ftu_sleep_goal">Sleep goal: %1$d min</string>
+    <string name="ftu_failed_to_get_user_physical_information_from_device_using_defaults">Failed to get user physical information from device, using defaults</string>
+
+    <!-- Preference keys -->
+    <string name="back_up_enabled">PSDC_back_up_enabled</string>
+    <string name="back_up_location">PSDC_back_up_location</string>
+    <!-- TODO: Remove or change this placeholder text -->
+    <string name="hello_blank_fragment">Hello blank fragment</string>
+
+    <!-- Export logs -->
+    <string name="export_logs_title">Export logs</string>
+    <string name="export_logs_summary">Export application logs to a file</string>
+    <string name="log_share_subject">PSDC logs</string>
+    <string name="log_share_text">Attached are the PSDC and SDK logs for debugging</string>
+    <string name="share_logs_via">Share logs via</string>
+
+    <!-- Sleep recording state -->
+    <string name="sleep_recording_state_unavailable">Sleep recording</string>
+    <string name="sleep_recording_state_on">Sleep recording on</string>
+    <string name="sleep_recording_state_off">Sleep recording off</string>
+
+    <!-- Firmware update -->
+    <string name="do_firmware_update">Do firmware update</string>
+    <string name="do_firmware_update_custom_url">Custom URL</string>
+    <string name="enter_firmware_url">Enter firmware URL</string>
+    <string name="firmware_update">Firmware update</string>
+    <string name="enter_the_url_for_firmware_update">Enter the URL for firmware update</string>
+    <string name="update">Update</string>
+    <string name="invalid_url">Invalid URL</string>
+    <string name="firmware_update_error_occurred">Error occurred when starting FWU: </string>
+    <string name="cancel">Cancel</string>
+    <string name="firmware_update_available">Firmware update available: %1$s</string>
+    <string name="firmware_update_check_failed">Firmware update check failed</string>
+
+    <!-- Battery status -->
+    <string name="charging">Charging</string>
+    <string name="discharging">Discharging</string>
+    <string name="fully_charged">Fully charged</string>
+
+    <!-- USB connection -->
+    <string name="usb_connection">USB Connection</string>
+    <string name="enable">Enable</string>
+    <string name="disable">Disable</string>
+
+    <!-- Automatic training detection -->
+    <string name="atd_setting">Automatic training detection (ATD)</string>
+    <string name="title_activity_user_device_settings">User device settings</string>
+    <string name="atd_setting_minimum_duration">ATD minimum training duration (sec)</string>
+    <string name="atd_setting_sensitivity">ATD sensitivity</string>
+
+    <!-- Telemetry / Trace logging -->
+    <string name="telemetry_setting">Trace logging (Telemetry)</string>
+
+    <!-- Training session -->
+    <string name="training_sessions_label">Training sessions</string>
+    <string name="get">Get</string>
+    <string name="no_training_sessions">No training sessions</string>
+    <string name="polar_training_session">Polar Training Session</string>
+    <string name="share_training_session">Share Training Session</string>
+    <string name="path">Path</string>
+    <string name="start_time">Start time</string>
+    <string name="share">Share</string>
+    <string name="details">Details:</string>
+
+    <!-- Wait connection -->
+    <string name="wait">Wait</string>
+    <string name="wait_connection">Wait Connection</string>
+    <string name="not_checked_yet">Not checked yet</string>
+    <string name="waiting_connection">Waiting connection</string>
+    <string name="connected">Connected</string>
+
+    <!-- Factory reset -->
+    <string name="do_factory_reset_header">Do factory reset</string>
+    <string name="do_factory_reset_switch_header">Save pairing data?</string>
+    <string name="confirm_factory_reset">Are you sure you want to perform a factory reset?</string>
+    <string name="confirm">Confirm</string>
+
+    <!-- Disk space -->
+    <string name="get_disk_space">Get disk space</string>
+    <string name="free_disk_space">Free disk space:</string>
+    <string name="total_disk_space">Total disk space:</string>
+    <string name="get_disk_space_error">Error getting disk space</string>
+    
+    <!-- BLE multi connection -->
+    <string name="ble_enable_disable">Set BLE multi connection mode</string>
+
+    <!-- Activity Recording -->
+    <string name="active_time_result_text">"Active time result"</string>
+    <string name="steps_analysis_result_text">"Steps analysis result"</string>
+    <string name="calories_analysis_result_text">"Calories analysis result"</string>
+    <string name="sleep_analysis_result_text">"Sleep analysis result"</string>
+    <string name="skin_temperature_result_text">"Skin temperature result"</string>
+    <string name="title_data_viewer">Loaded data</string>
+    <string name="activity_data_share">Share</string>
+    <string name="activity_data_view">View</string>
+
+    <!-- Data view -->
+    <string name="data_wait">Loading data from file, please wait</string>
+
+    <!-- Online recording service -->
+    <string name="online_recording_notification_title">PSDC online recording</string>
+    <string name="online_recording_notification_text">Online recording is active</string>
+
+    <!-- Activity samples data -->
+    <string name="activity_samples_label">Activity samples</string>
+
+    <!-- Daily summary data -->
+    <string name="daily_summary_label">Daily summary</string>
+
+    <!-- Battery present states -->
+    <string name="battery_present_state_present">Battery present</string>
+    <string name="battery_present_state_not_present">Battery not present</string>
+    <string name="battery_present_state_unknown">Battery present state unknown</string>
+
+    <!-- Wired power source states -->
+    <string name="wired_external_power_connected">"Power cable connected"</string>
+    <string name="wired_external_power_not_connected">"Power cable not connected"</string>
+    <string name="wired_external_power_unknown">"Power cable status unknown</string>
+    <string name="wired_external_power_reserved_for_future_use">Power cable status RFU</string>
+
+    <!-- Wireless power source states -->
+    <string name="wireless_external_power_connected">"Wireless power source connected"</string>
+    <string name="wireless_external_power_not_connected">"Wireless power source not connected"</string>
+    <string name="wireless_external_power_unknown">"Wireless power source status unknown</string>
+    <string name="wireless_external_power_reserved_for_future_use">Wireless power source status unknown</string>
+
+    <!-- User device settings -->
+    <string name="do_device_user_location_settings">Set user device settings</string>
+    <string name="set_device_user_settings_header">User Device Settings</string>
+    <string name="set_device_user_location">Set user device location</string>
+    <string name="user_device_settings_not_saved">User device settings not saved</string>
+    <string name="user_device_settings_saved">User device settings saved</string>
+    <string name="failed_to_load_settings">Failed to load settings: %1$s</string>
+    <string name="failed_to_save_settings">Failed to save settings: %1$s</string>
+    <string name="autos_file_generation">AUTOS file generation</string>
+
+    <!-- H10 Exercise -->
+    <string name="list_exercises">List Exercises</string>
+    <string name="read_exercise">Read Exercise</string>
+    <string name="remove_exercise">Remove Exercise</string>
+    <string name="stop_h10_recording">Stop H10 Recording</string>
+    <string name="start_h10_recording">Start H10 Recording</string>
+    <string name="exercises_found">Exercises found</string>
+    <string name="no_exercise_found">No exercise found</string>
+    <string name="no_exercise_to_remove">No exercise to remove</string>
+    <string name="exercise_removed_successfully">Exercise removed successfully</string>
+    <string name="exported_exercise_data">Exported Exercise Data</string>
+    <string name="attached_is_your_exercise_data_in_json_format">
+    Attached is your exercise data in JSON format.
+</string>
+    <string name="share_exercise_data">Share Exercise Data</string>
+    <string name="failed_to_share">Failed to share: %1$s</string>
+
+    <!-- HR broadcast listener -->
+    <string name="listen_hr_broadcasts">Listen HR broadcasts</string>
+    <string name="hr_broadcast_listener">HR Broadcast Listener</string>
+    <string name="devices_will_appear_here_note">Devices will appear here when broadcast is received…</string>
+    <string name="stop_listening">Stop listening</string>
+    <string name="start_listening">Start listening</string>
+    <string name="hr_value">Hr: %1$s bpm</string>
+    <string name="close">CLOSE</string>
+
+    <!-- Graphs -->
+    <string name="graph">Graph</string>
+    <string name="acc_value">ACC  x:%1$s  y:%2$s  z:%3$s</string>
+
+    <!-- Generic API texts -->
+    <string name="generic_api_generic_api_do_read_file_header">Read a file from device</string>
+    <string name="generic_api_do_write_file_header">Write a file to device</string>
+    <string name="generic_api_generic_api_do_delete_file_header">Delete a file or directory from device</string>
+    <string name="generic_api_generic_api_do_list_files_header">List files in device</string>
+    <string name="generic_api_generic_api_do_list_files_recurse_deep">Recurse deep</string>
+    <string name="generic_api_do_read_file">File name to read</string>
+    <string name="generic_api_do_write_file_path">File path to write</string>
+    <string name="generic_api_do_write_file_data">File data to write</string>
+    <string name="generic_api_do_list_files">List files from path</string>
+    <string name="generic_api_do_delete_file">Delete file or directory</string>
+    <string name="generic_api_open_view">Open</string>
+    <string name="generic_api_title">Experimental Low Level Api</string>
+    <string name="generic_api_button_read">Read</string>
+    <string name="generic_api_button_write">Write</string>
+    <string name="generic_api_button_list">List</string>
+    <string name="generic_api_button_delete">Delete</string>
+
+    <!-- Battery API texts -->
+    <string name="charge_state_header">Read charge state</string>
+
+    <!-- BLE connection API texts -->
+    <string name="ble_check_conn_api_title">Ble disconnected due to error?</string>
+    
+    <!-- BLE RSSI API texts -->
+    <string name="ble_signal_strength_header">Get BLE signal strength</string>
+
+    <!-- Exercise V2 -->
+    <string name="exercise_v2_start_exercise">Start Exercise</string>
+    <string name="exercise_v2_stop_exercise">Stop Exercise</string>
+    <string name="exercise_v2_check_status">Check Status</string>
+    <string name="exercise_v2_fetch_exercise">Fetch Exercise</string>
+    <string name="exercise_v2_remove_exercise">Remove Exercise</string>
+
+    <string name="exercise_v2_status_exercise_started">Exercise started</string>
+    <string name="exercise_v2_status_exercise_stopped">Exercise stopped</string>
+    <string name="exercise_v2_status_running">Exercise is running</string>
+    <string name="exercise_v2_status_not_running">No exercise running</string>
+    <string name="exercise_v2_status_fetching_exercise">Fetching exercise…</string>
+    <string name="exercise_v2_status_removing_exercise">Removing exercise…</string>
+    <string name="exercise_v2_status_removed_exercise">Exercise removed</string>
+    <string name="exercise_v2_status_share_opened">Share dialog opened</string>
+    <string name="exercise_v2_status_no_exercises">No exercises found</string>
+
+    <string name="exercise_v2_status_failed_to_start">Failed to start: %1$s</string>
+    <string name="exercise_v2_status_failed_to_stop">Failed to stop: %1$s</string>
+    <string name="exercise_v2_status_failed_to_get_status">Failed to get status: %1$s</string>
+    <string name="exercise_v2_status_failed_to_fetch">Failed to fetch: %1$s</string>
+    <string name="exercise_v2_status_failed_to_remove">Failed to remove: %1$s</string>
+
+    <string name="exercise_v2_share_title">Share Exercise Data</string>
+    <string name="exercise_v2_share_text">Exercise: %1$s\nSamples: %2$s</string>
+    <string name="exercise_v2_status_exercise_found">Exercise in device</string>
+    <string name="exercise_v2_prefix_fetch">Fetch</string>
+    <string name="exercise_v2_prefix_remove">Remove</string>
+
+    <!-- HR stream display -->
+    <string name="hr_label_bpm">bpm: </string>
+    <string name="hr_label_rrsms">rrsMs: </string>
+    <string name="hr_label_contact">contact: </string>
+    <string name="hr_rr_not_available">Not available</string>
+</resources>
