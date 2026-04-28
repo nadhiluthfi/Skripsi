@@ -1,8 +1,9 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math';
-import 'dart:ui';
+import 'dart:convert';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -75,6 +76,69 @@ const _beatBrdColors = {
 const _heartRateServiceUuid = '180d';
 const _heartRateMeasurementUuid = '2a37';
 
+// ─── Runtime configuration ─────────────────────────────────────────────────
+const int _modelWindowSamples = 180;
+const int _signalBufferSamples = 260;
+const int _stabilizationSeconds = 40;
+const int _chartHistoryBeats = 6;
+const int _chartBeatSamples = 96;
+const int _chartBeatGapSamples = 10;
+
+class EvaluationRow {
+  final String recordId;
+  final int centerSample;
+  final String annotationSymbol;
+  final int gtClassId;
+  final String gtClassName;
+  final String gtClassShort;
+  final List<double> raw;
+  final List<double> morph;
+
+  const EvaluationRow({
+    required this.recordId,
+    required this.centerSample,
+    required this.annotationSymbol,
+    required this.gtClassId,
+    required this.gtClassName,
+    required this.gtClassShort,
+    required this.raw,
+    required this.morph,
+  });
+}
+
+class BluetoothBeatTag {
+  final int sampleIndex;
+  final String shortClass;
+
+  const BluetoothBeatTag({required this.sampleIndex, required this.shortClass});
+
+  BluetoothBeatTag copyWith({int? sampleIndex, String? shortClass}) {
+    return BluetoothBeatTag(
+      sampleIndex: sampleIndex ?? this.sampleIndex,
+      shortClass: shortClass ?? this.shortClass,
+    );
+  }
+}
+
+class ChartBeatFrame {
+  final List<double> samples;
+  final int rPeakIndex;
+  final String shortClass;
+
+  const ChartBeatFrame({
+    required this.samples,
+    required this.rPeakIndex,
+    required this.shortClass,
+  });
+}
+
+class ChartSeriesData {
+  final List<FlSpot> spots;
+  final List<BluetoothBeatTag> beatTags;
+
+  const ChartSeriesData({required this.spots, required this.beatTags});
+}
+
 // ─── App ───────────────────────────────────────────────────────────────────
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
@@ -119,8 +183,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
   Timer? _inferenceTimer;
   Timer? _sessionTimer;
   Timer? _cpuTimer;
-  final Random _rng = Random();
-
+  Timer? _calibrationTimer;
   late AnimationController _pulseCtrl;
   late Animation<double> _pulseAnim;
 
@@ -164,12 +227,26 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     'Q': 'Unknown',
   };
 
-  final List<String> _simulationDemoClasses = const ['N', 'S', 'V', 'F', 'Q'];
+  List<EvaluationRow> _evaluationRows = [];
+  String? _uploadedCsvName;
+  bool _hasUploadedCsv = false;
+  int _currentEvalIndex = 0;
 
-  String? _currentSimulationDemoShort;
-  String? _currentSimulationDemoLong;
+  String _currentGroundTruthShort = '—';
+  String _currentGroundTruthLong = '—';
 
-  final List<double> _signalBuffer = List.generate(260, (_) => 0.0);
+  int _evalCorrect = 0;
+  int _evalWrong = 0;
+  int _evalTotal = 0;
+  double _evalAccuracy = 0.0;
+
+  bool _isCalibrating = false;
+  int _calibrationSecondsLeft = _stabilizationSeconds;
+
+  final List<double> _signalBuffer = List.generate(
+    _signalBufferSamples,
+    (_) => 0.0,
+  );
 
   double _lastFilteredLive = 0.0;
   double _prevLive1 = 0.0;
@@ -184,7 +261,8 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
   String _lastPredictionShort = '—';
   String _explanationText = 'Belum ada hasil klasifikasi.';
   double _predictionConfidence = 0.0;
-
+  double _lastInferenceMs = 0.0;
+  double _lastCpuAtInference = 0.0;
   String _duration = '00:00';
   String _sensorName = '—';
 
@@ -193,6 +271,8 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
   int _heartRate = 0;
   int _rrIntervalMs = 0;
   int _hrPacketCount = 0;
+  bool _isBluetoothInferenceBusy = false;
+  List<ChartBeatFrame> _chartBeatFrames = [];
 
   final Map<String, int> _classCounts = {
     'Normal': 0,
@@ -229,9 +309,10 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       duration: const Duration(milliseconds: 1200),
     )..repeat(reverse: true);
 
-    _pulseAnim = Tween<double>(begin: 1.0, end: 0.25).animate(
-      CurvedAnimation(parent: _pulseCtrl, curve: Curves.easeInOut),
-    );
+    _pulseAnim = Tween<double>(
+      begin: 1.0,
+      end: 0.25,
+    ).animate(CurvedAnimation(parent: _pulseCtrl, curve: Curves.easeInOut));
 
     _loadModel();
     _bindBluetoothState();
@@ -318,6 +399,179 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     await requests.request();
   }
 
+  Future<void> _activateSimulationMode() async {
+    await _disconnectPolarSensor(resetMode: false);
+    final loaded = await _pickAndLoadCsv();
+    if (!loaded || !mounted) return;
+
+    setState(() {
+      _isSimulationMode = true;
+      _sensorName = '—';
+      _status = 'Mode evaluasi aktif · ${_uploadedCsvName ?? 'CSV'}';
+    });
+  }
+
+  Future<bool> _pickAndLoadCsv() async {
+    try {
+      final result = await FilePicker.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: const ['csv'],
+        withData: true,
+        allowMultiple: false,
+      );
+
+      if (result == null || result.files.isEmpty) {
+        if (mounted) {
+          setState(() {
+            _status = 'Pemilihan file dibatalkan';
+          });
+        }
+        return false;
+      }
+
+      final picked = result.files.single;
+      String text;
+
+      if (picked.bytes != null) {
+        text = utf8.decode(picked.bytes!, allowMalformed: true);
+      } else if (picked.path != null) {
+        text = await File(picked.path!).readAsString();
+      } else {
+        throw Exception('File CSV tidak dapat dibaca');
+      }
+
+      final rows = _parseCsvText(text);
+      if (rows.isEmpty) {
+        throw Exception('CSV tidak memiliki data evaluasi yang valid');
+      }
+
+      if (!mounted) return false;
+      setState(() {
+        _evaluationRows = rows;
+        _uploadedCsvName = picked.name;
+        _hasUploadedCsv = true;
+        _currentEvalIndex = 0;
+        _currentGroundTruthShort = '—';
+        _currentGroundTruthLong = '—';
+        _status = 'Dataset evaluasi berhasil dimuat (${rows.length} sampel)';
+      });
+
+      _loadRowIntoSignalBuffer(rows.first);
+      return true;
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _evaluationRows = [];
+          _hasUploadedCsv = false;
+          _uploadedCsvName = null;
+          _status = 'Gagal memuat CSV: $e';
+        });
+      }
+      return false;
+    }
+  }
+
+  List<EvaluationRow> _parseCsvText(String text) {
+    final normalized = text.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+    final lines = const LineSplitter()
+        .convert(normalized)
+        .where((line) => line.trim().isNotEmpty)
+        .toList();
+
+    if (lines.length < 2) {
+      throw Exception('CSV kosong atau hanya berisi header');
+    }
+
+    final headers = lines.first
+        .split(',')
+        .map((h) => h.trim().replaceFirst('﻿', ''))
+        .toList();
+
+    int idx(String name) => headers.indexOf(name);
+
+    final recordIdIdx = idx('record_id');
+    final centerSampleIdx = idx('center_sample');
+    final annotationSymbolIdx = idx('annotation_symbol');
+    final gtClassIdIdx = idx('gt_class_id');
+    final gtClassNameIdx = idx('gt_class_name');
+    final gtClassShortIdx = idx('gt_class_short');
+
+    if ([
+      recordIdIdx,
+      centerSampleIdx,
+      annotationSymbolIdx,
+      gtClassIdIdx,
+      gtClassNameIdx,
+      gtClassShortIdx,
+    ].contains(-1)) {
+      throw Exception('Header metadata CSV tidak lengkap');
+    }
+
+    final rawIndexes = List<int>.generate(
+      _modelWindowSamples,
+      (i) => idx('raw_$i'),
+    );
+    final morphIndexes = List<int>.generate(37, (i) => idx('morph_$i'));
+
+    if (rawIndexes.contains(-1) || morphIndexes.contains(-1)) {
+      throw Exception(
+        'Kolom raw_0..raw_${_modelWindowSamples - 1} atau morph_0..morph_36 tidak lengkap',
+      );
+    }
+
+    final rows = <EvaluationRow>[];
+
+    for (final line in lines.skip(1)) {
+      final cols = line.split(',');
+      if (cols.length < headers.length) {
+        continue;
+      }
+
+      try {
+        final raw = [for (final i in rawIndexes) double.parse(cols[i].trim())];
+        final morph = [
+          for (final i in morphIndexes) double.parse(cols[i].trim()),
+        ];
+
+        if (raw.length != _modelWindowSamples || morph.length != 37) {
+          continue;
+        }
+
+        rows.add(
+          EvaluationRow(
+            recordId: cols[recordIdIdx].trim(),
+            centerSample: int.tryParse(cols[centerSampleIdx].trim()) ?? 0,
+            annotationSymbol: cols[annotationSymbolIdx].trim(),
+            gtClassId: int.tryParse(cols[gtClassIdIdx].trim()) ?? 0,
+            gtClassName: cols[gtClassNameIdx].trim(),
+            gtClassShort: cols[gtClassShortIdx].trim(),
+            raw: raw,
+            morph: morph,
+          ),
+        );
+      } catch (_) {
+        continue;
+      }
+    }
+
+    return rows;
+  }
+
+  void _loadRowIntoSignalBuffer(EvaluationRow row) {
+    for (int i = 0; i < _signalBuffer.length; i++) {
+      _signalBuffer[i] = 0.0;
+    }
+
+    final offset = max(0, _signalBuffer.length - row.raw.length);
+    for (
+      int i = 0;
+      i < row.raw.length && (offset + i) < _signalBuffer.length;
+      i++
+    ) {
+      _signalBuffer[offset + i] = row.raw[i];
+    }
+  }
+
   Future<void> _showSourcePicker() async {
     if (!mounted) return;
 
@@ -348,7 +602,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                 ),
                 const SizedBox(height: 8),
                 const Text(
-                  'Mode simulasi menjalankan inferensi ECG seperti sebelumnya. Mode Bluetooth memakai Polar H10 untuk monitoring heart rate actual secara real-time.',
+                  'Mode evaluasi memakai CSV berlabel untuk menguji model. Mode Bluetooth memakai Polar H10 untuk inferensi real-time dan pengukuran performa.',
                   style: TextStyle(color: T.txt2, fontSize: 14),
                 ),
                 const SizedBox(height: 18),
@@ -358,21 +612,15 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                       child: OutlinedButton.icon(
                         onPressed: () async {
                           Navigator.of(sheetCtx).pop();
-                          await _disconnectPolarSensor(resetMode: false);
-                          if (!mounted) return;
-                          setState(() {
-                            _isSimulationMode = true;
-                            _sensorName = '—';
-                            _status = 'Mode simulasi aktif';
-                          });
+                          await _activateSimulationMode();
                         },
                         style: OutlinedButton.styleFrom(
                           foregroundColor: T.txt,
                           side: const BorderSide(color: T.brd),
                           padding: const EdgeInsets.symmetric(vertical: 14),
                         ),
-                        icon: const Icon(Icons.auto_graph_rounded, size: 18),
-                        label: const Text('Mode Simulasi'),
+                        icon: const Icon(Icons.upload_file_rounded, size: 18),
+                        label: const Text('Upload & Evaluasi'),
                       ),
                     ),
                     const SizedBox(width: 10),
@@ -391,7 +639,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                           Icons.bluetooth_searching_rounded,
                           size: 18,
                         ),
-                        label: const Text('Bluetooth HR'),
+                        label: const Text('Bluetooth'),
                       ),
                     ),
                   ],
@@ -493,7 +741,8 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
         await device.connect(timeout: const Duration(seconds: 15));
       } catch (e) {
         final msg = e.toString().toLowerCase();
-        final alreadyConnected = msg.contains('already connected') ||
+        final alreadyConnected =
+            msg.contains('already connected') ||
             msg.contains('connection already exists');
         if (!alreadyConnected) rethrow;
       }
@@ -516,7 +765,9 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       }
 
       if (hrChar == null) {
-        throw Exception('Characteristic Heart Rate Measurement tidak ditemukan');
+        throw Exception(
+          'Characteristic Heart Rate Measurement tidak ditemukan',
+        );
       }
 
       _hrValueSub?.cancel();
@@ -594,36 +845,47 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       rrMs = (rrRaw * 1000 / 1024).round();
     }
 
+    final effectiveRrMs = rrMs > 0 ? rrMs : _rrIntervalMs;
+
     if (_isRunning && !_isSimulationMode) {
       _signalBuffer.removeAt(0);
       _signalBuffer.add(hr.toDouble());
-      _hrPacketCount++;
-      _beatsProcessed = _hrPacketCount;
-      _detectedRPeaks = _hrPacketCount;
+      if (!_isCalibrating) {
+        _hrPacketCount++;
+        _beatsProcessed = _hrPacketCount;
+        _detectedRPeaks = _hrPacketCount;
+      }
     }
 
-    final liveClass = _classifyLiveBeat(hr: hr, rrMs: rrMs);
+    final fallbackClass = _classifyLiveBeat(hr: hr, rrMs: effectiveRrMs);
 
     if (!mounted) return;
     setState(() {
       _heartRate = hr;
-      if (rrMs > 0) {
-        _rrIntervalMs = rrMs;
+      if (effectiveRrMs > 0) {
+        _rrIntervalMs = effectiveRrMs;
       }
 
-      if (_isRunning && !_isSimulationMode) {
-        _lastPredictionShort = liveClass['short']!;
-        _lastPredictionClass = liveClass['full']!;
-        _predictionConfidence = 0.0;
-        _explanationText = _buildExplanationText(
-          predictedShort: _lastPredictionShort,
-          isBluetoothMode: true,
-        );
-        _status = 'Bluetooth aktif · Klasifikasi ${_lastPredictionShort}';
+      if (_isRunning && !_isSimulationMode && !_isCalibrating) {
+        _status = _isBluetoothInferenceBusy
+            ? 'Bluetooth aktif - Menyelesaikan inferensi sebelumnya'
+            : 'Bluetooth aktif - Menjalankan inferensi model';
       } else {
-        _status = 'Sensor terhubung: $_sensorName';
+        _status = _isCalibrating
+            ? 'Stabilisasi sinyal Bluetooth... $_calibrationSecondsLeft detik'
+            : 'Sensor terhubung: $_sensorName';
       }
     });
+
+    if (_isRunning && !_isSimulationMode && !_isCalibrating) {
+      unawaited(
+        _runBluetoothInference(
+          hr: hr,
+          rrMs: effectiveRrMs,
+          fallbackClass: fallbackClass,
+        ),
+      );
+    }
   }
 
   Future<void> _disconnectPolarSensor({bool resetMode = true}) async {
@@ -653,6 +915,8 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       _isPolarConnecting = false;
       _heartRate = 0;
       _rrIntervalMs = 0;
+      _isBluetoothInferenceBusy = false;
+      _chartBeatFrames = [];
       _sensorName = '—';
       if (resetMode) {
         _isSimulationMode = false;
@@ -706,7 +970,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                 ),
                 SizedBox(height: 12),
                 Text(
-                  'Aplikasi sedang mencari Polar H10 untuk monitoring heart rate real-time.',
+                  'Aplikasi sedang mencari Polar H10 untuk mode Bluetooth real-time.',
                   style: TextStyle(color: T.txt2, fontSize: 14),
                 ),
               ],
@@ -777,7 +1041,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                 ),
                 const SizedBox(height: 12),
                 const Text(
-                  'Nyalakan Bluetooth terlebih dahulu untuk monitoring heart rate actual, atau lanjutkan dengan mode simulasi.',
+                  'Nyalakan Bluetooth terlebih dahulu untuk menjalankan mode sensor Polar H10, atau lanjutkan dengan mode evaluasi CSV.',
                   style: TextStyle(color: T.txt2, fontSize: 14),
                 ),
                 const SizedBox(height: 18),
@@ -797,20 +1061,16 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                     const SizedBox(width: 10),
                     Expanded(
                       child: ElevatedButton(
-                        onPressed: () {
+                        onPressed: () async {
                           Navigator.of(sheetCtx).pop();
-                          if (!mounted) return;
-                          setState(() {
-                            _isSimulationMode = true;
-                            _status = 'Mode simulasi aktif';
-                          });
+                          await _activateSimulationMode();
                         },
                         style: ElevatedButton.styleFrom(
                           backgroundColor: T.green,
                           foregroundColor: T.bg,
                           padding: const EdgeInsets.symmetric(vertical: 14),
                         ),
-                        child: const Text('Mode Simulasi'),
+                        child: const Text('Upload CSV'),
                       ),
                     ),
                   ],
@@ -875,7 +1135,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                 ),
                 const SizedBox(height: 12),
                 const Text(
-                  'Pastikan Polar H10 aktif dan dapat dipindai, lalu coba lagi atau jalankan mode simulasi.',
+                  'Pastikan Polar H10 aktif dan dapat dipindai, lalu coba lagi atau jalankan mode evaluasi CSV.',
                   style: TextStyle(color: T.txt2, fontSize: 14),
                 ),
                 const SizedBox(height: 18),
@@ -898,20 +1158,16 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                     const SizedBox(width: 10),
                     Expanded(
                       child: ElevatedButton(
-                        onPressed: () {
+                        onPressed: () async {
                           Navigator.of(sheetCtx).pop();
-                          if (!mounted) return;
-                          setState(() {
-                            _isSimulationMode = true;
-                            _status = 'Mode simulasi aktif';
-                          });
+                          await _activateSimulationMode();
                         },
                         style: ElevatedButton.styleFrom(
                           backgroundColor: T.green,
                           foregroundColor: T.bg,
                           padding: const EdgeInsets.symmetric(vertical: 14),
                         ),
-                        child: const Text('Mode Simulasi'),
+                        child: const Text('Upload CSV'),
                       ),
                     ),
                   ],
@@ -924,75 +1180,96 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     );
   }
 
-  String _pickRandomSimulationClass() {
-    final candidates = List<String>.from(_simulationDemoClasses);
-
-    if (_currentSimulationDemoShort != null && candidates.length > 1) {
-      candidates.remove(_currentSimulationDemoShort);
+  void _startCalibrationPhase() {
+    _calibrationTimer?.cancel();
+    if (_isSimulationMode) {
+      setState(() {
+        _isCalibrating = false;
+        _calibrationSecondsLeft = 0;
+      });
+      _startActiveSessionTimers();
+      return;
     }
 
-    return candidates[_rng.nextInt(candidates.length)];
+    setState(() {
+      _isCalibrating = true;
+      _calibrationSecondsLeft = _stabilizationSeconds;
+      _status =
+          'Stabilisasi sinyal Bluetooth... $_calibrationSecondsLeft detik';
+    });
+    unawaited(_readCpuUsage());
+
+    _calibrationTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted || !_isRunning) {
+        timer.cancel();
+        return;
+      }
+
+      if (_calibrationSecondsLeft <= 1) {
+        timer.cancel();
+        setState(() {
+          _isCalibrating = false;
+          _calibrationSecondsLeft = 0;
+        });
+        _startActiveSessionTimers();
+        return;
+      }
+
+      setState(() {
+        _calibrationSecondsLeft -= 1;
+        _status =
+            'Stabilisasi sinyal Bluetooth... $_calibrationSecondsLeft detik';
+      });
+    });
   }
 
-  void _prepareSimulationSessionClass() {
-    if (!_isSimulationMode) return;
+  void _startActiveSessionTimers() {
+    _sessionTimer?.cancel();
+    _cpuTimer?.cancel();
+    _inferenceTimer?.cancel();
 
-    final nextShort = _pickRandomSimulationClass();
-    _currentSimulationDemoShort = nextShort;
-    _currentSimulationDemoLong = _shortToLong[nextShort] ?? 'Unknown';
-  }
+    _sessionTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      _sessionSeconds++;
+      final mm = (_sessionSeconds ~/ 60).toString().padLeft(2, '0');
+      final ss = (_sessionSeconds % 60).toString().padLeft(2, '0');
+      if (mounted) {
+        setState(() {
+          _duration = '$mm:$ss';
+        });
+      }
+    });
 
-  double _buildSimulationSample(int phase) {
-    final demoClass = _currentSimulationDemoShort ?? 'N';
+    _cpuTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      unawaited(_readCpuUsage());
+    });
+    unawaited(_readCpuUsage());
 
-    switch (demoClass) {
-      case 'S':
-        if (phase == 0) return 0.96;
-        if (phase == 1) return -0.58;
-        if (phase < 6) return 0.16;
-        if (phase < 15) return 0.03 * sin(_tick / 3.0);
-        return 0.0;
-      case 'V':
-        if (phase == 0) return 1.25;
-        if (phase == 1) return -0.92;
-        if (phase < 8) return 0.18 + 0.04 * sin(_tick / 4.5);
-        if (phase < 18) return -0.06 + 0.03 * sin(_tick / 3.4);
-        return 0.0;
-      case 'F':
-        if (phase == 0) return 1.02;
-        if (phase == 1) return -0.64;
-        if (phase < 7) return 0.10;
-        if (phase < 20) return 0.08 + 0.06 * sin(_tick / 4.0);
-        return 0.0;
-      case 'Q':
-        if (phase == 0) return 0.72 + (_rng.nextDouble() * 0.12);
-        if (phase == 1) return -0.42;
-        return (_rng.nextDouble() - 0.5) * 0.06;
-      case 'N':
-      default:
-        if (phase == 0) return 1.10;
-        if (phase == 1) return -0.82;
-        if (phase < 6) return 0.10;
-        if (phase < 13) return 0.015 * sin(_tick / 3.0);
-        if (phase < 21) return 0.13 + 0.05 * sin(_tick / 4.0);
-        return 0.0;
+    if (_isSimulationMode) {
+      _status = 'Mode evaluasi aktif · Menjalankan inferensi';
+      unawaited(_runStreamingInference());
+      _inferenceTimer = Timer.periodic(const Duration(milliseconds: 600), (_) {
+        unawaited(_runStreamingInference());
+      });
+    } else {
+      _status = 'Bluetooth aktif · Menunggu data sensor';
     }
   }
 
-  int _heartRateForSimulationClass() {
-    switch (_currentSimulationDemoShort ?? 'N') {
-      case 'S':
-        return 118;
-      case 'V':
-        return 124;
-      case 'F':
-        return 112;
-      case 'Q':
-        return 96;
-      case 'N':
-      default:
-        return 110;
-    }
+  String _buildEvaluationExplanation({
+    required String predictedShort,
+    required String gtShort,
+    required bool isCorrect,
+  }) {
+    final base = _buildExplanationText(
+      predictedShort: predictedShort,
+      isBluetoothMode: false,
+    );
+
+    final compareText = isCorrect
+        ? 'Prediksi sesuai dengan ground truth dari file CSV.'
+        : 'Prediksi tidak sesuai dengan ground truth ($gtShort) pada sampel ini.';
+
+    return '$base $compareText';
   }
 
   void _startSession() {
@@ -1001,42 +1278,22 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       return;
     }
 
-    if (!_isSimulationMode && !_isPolarConnected) {
+    if (_isRunning) return;
+
+    if (_isSimulationMode) {
+      if (!_hasUploadedCsv || _evaluationRows.isEmpty) {
+        setState(() {
+          _status = 'Upload file CSV ground truth terlebih dahulu';
+        });
+        return;
+      }
+    } else if (!_isPolarConnected) {
       setState(() => _status = 'Sensor Bluetooth belum tersambung');
       return;
     }
 
-    if (_isRunning) return;
-
-    if (_isSimulationMode) {
-      _prepareSimulationSessionClass();
-    } else {
-      _currentSimulationDemoShort = null;
-      _currentSimulationDemoLong = null;
-    }
-
     _resetSessionState();
-
-    if (_isSimulationMode) {
-      _simulationTimer = Timer.periodic(const Duration(milliseconds: 60), (_) {
-        _updateSimulationSignal();
-      });
-
-      _inferenceTimer = Timer.periodic(const Duration(milliseconds: 320), (_) {
-        _runStreamingInference();
-      });
-    }
-
-    _sessionTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      _sessionSeconds++;
-      final mm = (_sessionSeconds ~/ 60).toString().padLeft(2, '0');
-      final ss = (_sessionSeconds % 60).toString().padLeft(2, '0');
-      if (mounted) setState(() => _duration = '$mm:$ss');
-    });
-
-    _cpuTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      _readCpuUsage();
-    });
+    _startCalibrationPhase();
   }
 
   void _resetSessionState() {
@@ -1044,6 +1301,10 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       _signalBuffer[i] = _isSimulationMode
           ? 0.0
           : (_heartRate > 0 ? _heartRate.toDouble() : 0.0);
+    }
+
+    if (_isSimulationMode && _evaluationRows.isNotEmpty) {
+      _loadRowIntoSignalBuffer(_evaluationRows.first);
     }
 
     _lastFilteredLive = 0.0;
@@ -1055,16 +1316,24 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
 
     setState(() {
       _isRunning = true;
+      _isCalibrating = false;
+      _calibrationSecondsLeft = _isSimulationMode ? 0 : _stabilizationSeconds;
       _tick = 0;
       _sessionSeconds = 0;
       _duration = '00:00';
       _hrPacketCount = 0;
+      _isBluetoothInferenceBusy = false;
 
       _lastPredictionClass = '—';
       _lastPredictionShort = '—';
       _predictionConfidence = 0.0;
+      _lastInferenceMs = 0.0;
+      _lastCpuAtInference = 0.0;
+      _chartBeatFrames = [];
+      _currentGroundTruthShort = '—';
+      _currentGroundTruthLong = '—';
       _explanationText = _isSimulationMode
-          ? 'Menunggu hasil klasifikasi dari sinyal simulasi.'
+          ? 'Menunggu inferensi dari file evaluasi.'
           : 'Menunggu paket data sensor untuk memperbarui klasifikasi live.';
 
       _latencyHistoryMs.clear();
@@ -1085,10 +1354,16 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       _detectedRPeaks = 0;
       _beatsProcessed = 0;
 
+      _evalCorrect = 0;
+      _evalWrong = 0;
+      _evalTotal = 0;
+      _evalAccuracy = 0.0;
+      _currentEvalIndex = 0;
+
       if (_isSimulationMode) {
-        _status = 'Mode simulasi aktif · Menunggu klasifikasi';
+        _status = 'Mode evaluasi siap · Memulai inferensi';
       } else {
-        _status = 'Bluetooth aktif · Menunggu data sensor';
+        _status = 'Bluetooth siap · Menunggu stabilisasi sinyal';
       }
 
       for (final k in _classCounts.keys) {
@@ -1102,20 +1377,28 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     _inferenceTimer?.cancel();
     _sessionTimer?.cancel();
     _cpuTimer?.cancel();
+    _calibrationTimer?.cancel();
 
     _simulationTimer = null;
     _inferenceTimer = null;
     _sessionTimer = null;
     _cpuTimer = null;
+    _calibrationTimer = null;
 
     if (mounted) {
-      setState(() => _isRunning = false);
+      setState(() {
+        _isRunning = false;
+        _isCalibrating = false;
+        _isBluetoothInferenceBusy = false;
+      });
     }
 
     if (showSummary) {
       final canShowSummary = _isSimulationMode
-          ? _lastPredictionShort != '—'
-          : (_isPolarConnected || _sensorName != '—' || _lastPredictionShort != '—');
+          ? _evalTotal > 0
+          : (_isPolarConnected ||
+                _sensorName != '—' ||
+                _lastPredictionShort != '—');
 
       if (canShowSummary) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1128,8 +1411,9 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
   void _showSessionSummaryDrawer() {
     if (!mounted) return;
 
-    final title =
-        _isSimulationMode ? 'Sesi simulasi selesai' : 'Sesi Bluetooth selesai';
+    final title = _isSimulationMode
+        ? 'Sesi evaluasi selesai'
+        : 'Sesi Bluetooth selesai';
 
     showModalBottomSheet<void>(
       context: context,
@@ -1159,10 +1443,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                         borderRadius: BorderRadius.circular(12),
                         border: Border.all(color: T.greenBrd),
                       ),
-                      child: const Icon(
-                        Icons.insights_rounded,
-                        color: T.green,
-                      ),
+                      child: const Icon(Icons.insights_rounded, color: T.green),
                     ),
                     const SizedBox(width: 12),
                     Expanded(
@@ -1187,19 +1468,54 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                   ),
                 ),
                 const SizedBox(height: 12),
-                _SummaryLine('Mode', _isSimulationMode ? 'Simulasi' : 'Bluetooth'),
+                _SummaryLine(
+                  'Mode',
+                  _isSimulationMode ? 'Evaluasi CSV' : 'Bluetooth',
+                ),
+                if (_isSimulationMode && _uploadedCsvName != null)
+                  _SummaryLine('File CSV', _uploadedCsvName!),
                 _SummaryLine('Klasifikasi terakhir', _lastPredictionClass),
+                if (_isSimulationMode)
+                  _SummaryLine('Ground truth', _groundTruthLabel),
                 _SummaryLine(
                   'Confidence',
                   _predictionConfidence > 0
                       ? '${(100 * _predictionConfidence).toStringAsFixed(1)}%'
                       : '—',
                 ),
-                if (!_isSimulationMode)
+                _SummaryLine(
+                  'Waktu inferensi terakhir',
+                  _lastInferenceMs > 0
+                      ? '${_lastInferenceMs.toStringAsFixed(3)} ms'
+                      : '—',
+                ),
+                _SummaryLine(
+                  'CPU saat prediksi',
+                  _formatCpuValue(_lastCpuAtInference),
+                ),
+                if (_isSimulationMode) ...[
+                  _SummaryLine(
+                    'Total sampel',
+                    '$_evalTotal / ${_evaluationRows.length}',
+                  ),
+                  _SummaryLine('Benar', '$_evalCorrect'),
+                  _SummaryLine('Salah', '$_evalWrong'),
+                  _SummaryLine(
+                    'Akurasi',
+                    '${(_evalAccuracy * 100).toStringAsFixed(1)}%',
+                  ),
+                ],
+                if (!_isSimulationMode) ...[
                   _SummaryLine(
                     'Sensor',
                     _isPolarConnected ? _sensorName : 'Belum tersambung',
                   ),
+                  _SummaryLine('Data sensor', _bluetoothReferenceLabel),
+                  _SummaryLine(
+                    'Distribusi dominan sesi',
+                    _dominantClassFromCounts(_classCounts),
+                  ),
+                ],
                 const SizedBox(height: 12),
                 Container(
                   width: double.infinity,
@@ -1210,7 +1526,11 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                     border: Border.all(color: T.brd),
                   ),
                   child: Text(
-                    'Penjelasan hasil:\n\n$_explanationText',
+                    !_isSimulationMode
+                        ? 'Catatan mode:\n'
+                              'Mode Bluetooth memakai sinyal live sensor tanpa label referensi sehingga ringkasan ini tidak menghitung tingkat ketepatan. Ringkasan ini difokuskan pada prediksi live, waktu inferensi, CPU, dan kestabilan sensor.'
+                        : 'Penjelasan hasil:\n$_explanationText\n\n'
+                              'Ground truth:\n$_groundTruthCaption',
                     style: const TextStyle(
                       color: T.txt,
                       fontSize: 13,
@@ -1239,12 +1559,31 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     );
   }
 
-  Future<void> _readCpuUsage() async {
+  bool _isValidCpuUsage(double? value) {
+    return value != null &&
+        value.isFinite &&
+        !value.isNaN &&
+        value >= 0 &&
+        value <= 100;
+  }
+
+  String _formatCpuValue(
+    double value, {
+    int decimals = 2,
+    bool compact = false,
+    String unavailable = '—',
+  }) {
+    if (!_isValidCpuUsage(value)) return unavailable;
+    final suffix = compact ? '%' : ' %';
+    return '${value.toStringAsFixed(decimals)}$suffix';
+  }
+
+  Future<double?> _sampleCpuUsageSafe() async {
     double? cpu;
 
     try {
       final value = await _perfChannel.invokeMethod<double>('getCpuUsage');
-      cpu = value;
+      if (_isValidCpuUsage(value)) cpu = value;
     } catch (_) {}
 
     if (cpu == null && Platform.isAndroid) {
@@ -1260,64 +1599,53 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
           final iowait = parts.length > 5 ? (int.tryParse(parts[5]) ?? 0) : 0;
           final total = user + nice + system + idle + iowait;
           final busy = user + nice + system;
-          if (total > 0) cpu = (busy / total) * 100.0;
+          if (total > 0) {
+            final sampled = (busy / total) * 100.0;
+            if (_isValidCpuUsage(sampled)) cpu = sampled;
+          }
         }
       } catch (_) {}
     }
 
-    cpu ??= 15.0 + _rng.nextDouble() * 20.0;
+    return cpu;
+  }
+
+  Future<void> _readCpuUsage() async {
+    final cpu = await _sampleCpuUsageSafe();
+    final rssMb = _readMemoryUsageMb();
 
     if (!mounted) return;
 
     setState(() {
-      _cpuCurrent = cpu!;
-      if (_cpuMin == 0 || cpu < _cpuMin) _cpuMin = cpu;
-      if (cpu > _cpuMax) _cpuMax = cpu;
+      _updateMemoryStats(rssMb: rssMb);
+      if (cpu != null) {
+        _updateCpuStats(cpu);
+      }
     });
   }
 
   void _updateSimulationSignal() {
-    _tick++;
-    final phase = _tick % 36;
-    final sample = _buildSimulationSample(phase);
-
-    _signalBuffer.removeAt(0);
-    _signalBuffer.add(sample);
-
-    if (phase == 0) {
-      _detectedRPeaks++;
-    }
-
-    _heartRate = _heartRateForSimulationClass();
-
-    if (mounted) {
-      setState(() {});
-    }
+    // Legacy dummy simulation is no longer used.
   }
 
   Future<void> _runStreamingInference() async {
-    if (_interpreter == null || !_isSimulationMode) return;
+    if (_interpreter == null || !_isSimulationMode || _isCalibrating) return;
+    if (_currentEvalIndex >= _evaluationRows.length) {
+      _stopSession(showSummary: true);
+      return;
+    }
 
     try {
-      final rawInput = [
-        List.generate(180, (i) {
-          final src = max(0, _signalBuffer.length - 180 + i);
-          return [_signalBuffer[src]];
-        }),
-      ];
+      final row = _evaluationRows[_currentEvalIndex];
+      _loadRowIntoSignalBuffer(row);
 
-      final morphInput = [
-        List.generate(37, (i) {
-          final anchor = _signalBuffer[
-              max(0, _signalBuffer.length - 1 - min(i * 3, 179))];
-          return (anchor.abs() + (i * 0.007)) % 1.0;
-        }),
+      final rawInput = [
+        row.raw.map((v) => [v]).toList(),
       ];
+      final morphInput = [row.morph];
 
       final inputs = [rawInput, morphInput];
-      final output = {
-        0: List.generate(1, (_) => List.filled(5, 0.0)),
-      };
+      final output = {0: List.generate(1, (_) => List.filled(5, 0.0))};
 
       final sw = Stopwatch()..start();
       _interpreter!.runForMultipleInputs(inputs, output);
@@ -1327,6 +1655,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       _latencyHistoryMs.add(latencyMs);
       _updateLatencyStats();
       _updateMemoryStats();
+      final cpuAtInference = await _sampleCpuUsageSafe();
 
       final probs = (output[0] as List<List<double>>)[0];
       int bestIdx = 0;
@@ -1337,29 +1666,162 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       final predictedClass = _classNames[bestIdx];
       final predictedShort = _classShort[predictedClass] ?? '—';
       final confidence = probs[bestIdx].clamp(0.0, 1.0);
+      final isCorrect = predictedClass == row.gtClassName;
 
       _totalInferenceRuns++;
-      _beatsProcessed = _totalInferenceRuns;
-      _throughput =
-          _sessionSeconds > 0 ? _totalInferenceRuns / _sessionSeconds : 0;
+      _evalTotal++;
+      if (isCorrect) {
+        _evalCorrect++;
+      } else {
+        _evalWrong++;
+      }
+      _evalAccuracy = _evalTotal == 0 ? 0.0 : _evalCorrect / _evalTotal;
+      _beatsProcessed = _evalTotal;
+      _detectedRPeaks = _evalTotal;
+      _throughput = _sessionSeconds > 0
+          ? _totalInferenceRuns / _sessionSeconds
+          : 0;
 
       _incrementCountForShortClass(predictedShort);
 
       if (!mounted) return;
       setState(() {
+        _pushChartBeatFrame(_buildCsvChartBeatFrame(row, predictedShort));
         _lastPredictionClass = predictedClass;
         _lastPredictionShort = predictedShort;
         _predictionConfidence = confidence;
-        _explanationText = _buildExplanationText(
+        _lastInferenceMs = latencyMs;
+        if (cpuAtInference != null) {
+          _lastCpuAtInference = cpuAtInference;
+          _updateCpuStats(cpuAtInference);
+        }
+        _currentGroundTruthShort = row.gtClassShort;
+        _currentGroundTruthLong = row.gtClassName;
+        _explanationText = _buildEvaluationExplanation(
           predictedShort: predictedShort,
-          isBluetoothMode: false,
+          gtShort: row.gtClassShort,
+          isCorrect: isCorrect,
         );
-
-        _status = 'Mode simulasi aktif · Klasifikasi $predictedShort';
+        _status =
+            'Mode evaluasi aktif · Pred $predictedShort vs GT ${row.gtClassShort}';
       });
+
+      _currentEvalIndex++;
+      if (_currentEvalIndex >= _evaluationRows.length) {
+        Future.microtask(() => _stopSession(showSummary: true));
+      }
     } catch (e) {
       if (!mounted) return;
       setState(() => _status = 'Kesalahan inferensi: $e');
+    }
+  }
+
+  Future<void> _runBluetoothInference({
+    required int hr,
+    required int rrMs,
+    required Map<String, String> fallbackClass,
+  }) async {
+    if (_interpreter == null ||
+        !_isRunning ||
+        _isSimulationMode ||
+        _isCalibrating ||
+        _isBluetoothInferenceBusy) {
+      return;
+    }
+
+    _isBluetoothInferenceBusy = true;
+
+    try {
+      final rawWindow = _buildLiveRawWindow();
+      final morph = _buildLiveMorphFeatures(
+        rawWindow: rawWindow,
+        hr: hr,
+        rrMs: rrMs,
+      );
+
+      final rawInput = [
+        rawWindow.map((v) => [v]).toList(),
+      ];
+      final morphInput = [morph];
+      final output = {0: List.generate(1, (_) => List.filled(5, 0.0))};
+
+      final sw = Stopwatch()..start();
+      _interpreter!.runForMultipleInputs([rawInput, morphInput], output);
+      sw.stop();
+
+      final latencyMs = sw.elapsedMicroseconds / 1000.0;
+      _latencyHistoryMs.add(latencyMs);
+      _updateLatencyStats();
+      _updateMemoryStats();
+      final cpuAtInference = await _sampleCpuUsageSafe();
+
+      final probs = (output[0] as List<List<double>>)[0];
+      int bestIdx = 0;
+      for (int i = 1; i < probs.length; i++) {
+        if (probs[i] > probs[bestIdx]) bestIdx = i;
+      }
+
+      final predictedClass = _classNames[bestIdx];
+      final predictedShort =
+          _classShort[predictedClass] ?? fallbackClass['short']!;
+      final confidence = probs[bestIdx].clamp(0.0, 1.0);
+
+      _totalInferenceRuns++;
+      _throughput = _sessionSeconds > 0
+          ? _totalInferenceRuns / _sessionSeconds
+          : 0;
+      _incrementCountForShortClass(predictedShort);
+
+      if (!mounted) return;
+      setState(() {
+        _pushChartBeatFrame(
+          _buildSyntheticChartBeatFrame(shortClass: predictedShort, rrMs: rrMs),
+        );
+        _lastPredictionClass = predictedClass;
+        _lastPredictionShort = predictedShort;
+        _predictionConfidence = confidence;
+        _lastInferenceMs = latencyMs;
+        if (cpuAtInference != null) {
+          _lastCpuAtInference = cpuAtInference;
+          _updateCpuStats(cpuAtInference);
+        }
+        _explanationText = _buildExplanationText(
+          predictedShort: predictedShort,
+          isBluetoothMode: true,
+        );
+        _status = 'Bluetooth aktif - Inferensi $predictedShort';
+      });
+    } catch (_) {
+      final predictedShort = fallbackClass['short'] ?? 'Q';
+      final predictedClass = fallbackClass['full'] ?? 'Unknown';
+
+      _totalInferenceRuns++;
+      _throughput = _sessionSeconds > 0
+          ? _totalInferenceRuns / _sessionSeconds
+          : 0;
+      _incrementCountForShortClass(predictedShort);
+      final cpuAtInference = await _sampleCpuUsageSafe();
+
+      if (!mounted) return;
+      setState(() {
+        _pushChartBeatFrame(
+          _buildSyntheticChartBeatFrame(shortClass: predictedShort, rrMs: rrMs),
+        );
+        _lastPredictionClass = predictedClass;
+        _lastPredictionShort = predictedShort;
+        _predictionConfidence = 0.0;
+        if (cpuAtInference != null) {
+          _lastCpuAtInference = cpuAtInference;
+          _updateCpuStats(cpuAtInference);
+        }
+        _explanationText = _buildExplanationText(
+          predictedShort: predictedShort,
+          isBluetoothMode: true,
+        );
+        _status = 'Bluetooth aktif - Fallback $predictedShort';
+      });
+    } finally {
+      _isBluetoothInferenceBusy = false;
     }
   }
 
@@ -1388,7 +1850,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     required bool isBluetoothMode,
   }) {
     if (isBluetoothMode) {
-      return 'Klasifikasi live ditampilkan dari paket data sensor yang sedang diterima.';
+      return 'Mode Bluetooth memakai sinyal live sensor tanpa label referensi. Hasil ini menampilkan prediksi model TFLite, waktu inferensi, dan CPU berdasarkan buffer sinyal live dari paket HR/RR sensor.';
     }
 
     return switch (predictedShort) {
@@ -1407,10 +1869,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     };
   }
 
-  Map<String, String> _classifyLiveBeat({
-    required int hr,
-    required int rrMs,
-  }) {
+  Map<String, String> _classifyLiveBeat({required int hr, required int rrMs}) {
     if (hr <= 0) {
       return const {'short': '—', 'full': 'Menunggu data'};
     }
@@ -1456,22 +1915,476 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     _latencyMax = _latencyHistoryMs.reduce(max);
   }
 
-  void _updateMemoryStats() {
-    final rssMb = ProcessInfo.currentRss / (1024 * 1024);
-    _ramCurrentMb = rssMb;
-    if (_ramMinMb == 0 || rssMb < _ramMinMb) _ramMinMb = rssMb;
-    if (rssMb > _ramMaxMb) _ramMaxMb = rssMb;
+  double _readMemoryUsageMb() {
+    try {
+      return ProcessInfo.currentRss / (1024 * 1024);
+    } catch (_) {
+      return _ramCurrentMb;
+    }
   }
 
-  List<FlSpot> _buildSpots() {
-    return List.generate(
-      _signalBuffer.length,
-      (i) => FlSpot(i.toDouble(), _signalBuffer[i]),
+  void _updateMemoryStats({double? rssMb}) {
+    final value = rssMb ?? _readMemoryUsageMb();
+    _ramCurrentMb = value;
+    if (_ramMinMb == 0 || value < _ramMinMb) _ramMinMb = value;
+    if (value > _ramMaxMb) _ramMaxMb = value;
+  }
+
+  void _updateCpuStats(double cpu) {
+    if (!_isValidCpuUsage(cpu)) return;
+    _cpuCurrent = cpu;
+    if (_cpuMin == 0 || cpu < _cpuMin) _cpuMin = cpu;
+    if (cpu > _cpuMax) _cpuMax = cpu;
+  }
+
+  List<double> _buildLiveRawWindow() {
+    const windowSize = _modelWindowSamples;
+    final start = max(0, _signalBuffer.length - windowSize);
+    final window = List<double>.from(_signalBuffer.sublist(start));
+
+    while (window.length < windowSize) {
+      window.insert(0, window.isEmpty ? 0.0 : window.first);
+    }
+
+    final mean = window.reduce((a, b) => a + b) / window.length;
+    final variance =
+        window.map((v) => pow(v - mean, 2).toDouble()).reduce((a, b) => a + b) /
+        window.length;
+    final std = sqrt(variance);
+    final scale = std < 1e-6 ? 1.0 : std;
+
+    return [for (final value in window) (value - mean) / scale];
+  }
+
+  List<double> _buildLiveMorphFeatures({
+    required List<double> rawWindow,
+    required int hr,
+    required int rrMs,
+  }) {
+    final sorted = List<double>.from(rawWindow)..sort();
+    final diffs = <double>[
+      for (int i = 1; i < rawWindow.length; i++)
+        rawWindow[i] - rawWindow[i - 1],
+    ];
+    final mean = rawWindow.reduce((a, b) => a + b) / rawWindow.length;
+    final variance =
+        rawWindow
+            .map((v) => pow(v - mean, 2).toDouble())
+            .reduce((a, b) => a + b) /
+        rawWindow.length;
+    final std = sqrt(variance);
+    final minVal = sorted.first;
+    final maxVal = sorted.last;
+    final range = maxVal - minVal;
+    final median = sorted[sorted.length ~/ 2];
+    final p10 = sorted[((sorted.length - 1) * 0.10).round()];
+    final p25 = sorted[((sorted.length - 1) * 0.25).round()];
+    final p75 = sorted[((sorted.length - 1) * 0.75).round()];
+    final p90 = sorted[((sorted.length - 1) * 0.90).round()];
+    final rms = sqrt(
+      rawWindow.map((v) => v * v).reduce((a, b) => a + b) / rawWindow.length,
     );
+    final meanAbs =
+        rawWindow.map((v) => v.abs()).reduce((a, b) => a + b) /
+        rawWindow.length;
+    final energy =
+        rawWindow.map((v) => v * v).reduce((a, b) => a + b) / rawWindow.length;
+    final diffMean = diffs.reduce((a, b) => a + b) / diffs.length;
+    final diffVariance =
+        diffs
+            .map((v) => pow(v - diffMean, 2).toDouble())
+            .reduce((a, b) => a + b) /
+        diffs.length;
+    final diffStd = sqrt(diffVariance);
+    final diffAbsMean =
+        diffs.map((v) => v.abs()).reduce((a, b) => a + b) / diffs.length;
+
+    int zeroCrossings = 0;
+    for (int i = 1; i < diffs.length; i++) {
+      final previous = diffs[i - 1];
+      final current = diffs[i];
+      if ((previous <= 0 && current > 0) || (previous >= 0 && current < 0)) {
+        zeroCrossings++;
+      }
+    }
+
+    int peakCount = 0;
+    int troughCount = 0;
+    for (int i = 1; i < rawWindow.length - 1; i++) {
+      if (rawWindow[i] > rawWindow[i - 1] && rawWindow[i] > rawWindow[i + 1]) {
+        peakCount++;
+      }
+      if (rawWindow[i] < rawWindow[i - 1] && rawWindow[i] < rawWindow[i + 1]) {
+        troughCount++;
+      }
+    }
+
+    final half = rawWindow.length ~/ 2;
+    final left = rawWindow.sublist(0, half);
+    final right = rawWindow.sublist(half);
+    final leftMean = left.reduce((a, b) => a + b) / left.length;
+    final rightMean = right.reduce((a, b) => a + b) / right.length;
+    final centerStart = max(0, half - 5);
+    final centerEnd = min(rawWindow.length, half + 5);
+    final centerSlice = rawWindow.sublist(centerStart, centerEnd);
+    final centerMean = centerSlice.reduce((a, b) => a + b) / centerSlice.length;
+    final lag1 = _autocorrelation(rawWindow, 1);
+    final lag2 = _autocorrelation(rawWindow, 2);
+    final slope = (rawWindow.last - rawWindow.first) / (rawWindow.length - 1);
+    final positiveRatio =
+        rawWindow.where((v) => v > 0).length / rawWindow.length;
+    final consistency = rrMs > 0 ? ((hr * rrMs) / 60000.0) : 0.0;
+
+    return [
+      mean,
+      std,
+      minVal,
+      maxVal,
+      range,
+      median,
+      p10,
+      p25,
+      p75,
+      p90,
+      rms,
+      meanAbs,
+      energy,
+      diffMean,
+      diffStd,
+      diffAbsMean,
+      diffs.reduce(min),
+      diffs.reduce(max),
+      zeroCrossings / diffs.length,
+      positiveRatio,
+      peakCount / rawWindow.length,
+      troughCount / rawWindow.length,
+      rawWindow.first,
+      rawWindow[half],
+      rawWindow.last,
+      leftMean,
+      rightMean,
+      rightMean - leftMean,
+      lag1,
+      lag2,
+      slope,
+      hr / 200.0,
+      rrMs / 2000.0,
+      consistency,
+      centerMean,
+      rawWindow.map((v) => v.abs()).reduce(max),
+      variance,
+    ];
+  }
+
+  double _autocorrelation(List<double> values, int lag) {
+    if (lag <= 0 || lag >= values.length) return 0.0;
+
+    final mean = values.reduce((a, b) => a + b) / values.length;
+    double numerator = 0.0;
+    double denominator = 0.0;
+
+    for (int i = 0; i < values.length; i++) {
+      final centered = values[i] - mean;
+      denominator += centered * centered;
+      if (i + lag < values.length) {
+        numerator += centered * (values[i + lag] - mean);
+      }
+    }
+
+    if (denominator == 0.0) return 0.0;
+    return numerator / denominator;
+  }
+
+  void _pushChartBeatFrame(ChartBeatFrame frame) {
+    _chartBeatFrames.add(frame);
+    if (_chartBeatFrames.length > _chartHistoryBeats) {
+      _chartBeatFrames.removeRange(
+        0,
+        _chartBeatFrames.length - _chartHistoryBeats,
+      );
+    }
+  }
+
+  ChartBeatFrame _buildCsvChartBeatFrame(EvaluationRow row, String shortClass) {
+    final normalized = _normalizeEcgSamples(row.raw);
+    final samples = _resampleSignal(normalized, _chartBeatSamples);
+    return ChartBeatFrame(
+      samples: samples,
+      rPeakIndex: _findRPeakIndex(samples),
+      shortClass: shortClass,
+    );
+  }
+
+  ChartBeatFrame _buildSyntheticChartBeatFrame({
+    required String shortClass,
+    int rrMs = 0,
+  }) {
+    final sampleCount = (rrMs > 0 ? (rrMs / 14).round() : _chartBeatSamples)
+        .clamp(72, 112);
+    final profile = switch (shortClass) {
+      'S' => {
+        'pAmp': 0.17,
+        'qAmp': -0.12,
+        'rAmp': 0.92,
+        'sAmp': -0.26,
+        'tAmp': 0.28,
+        'rSigma': 0.015,
+        'tCenter': 0.72,
+      },
+      'V' => {
+        'pAmp': 0.06,
+        'qAmp': -0.08,
+        'rAmp': 1.18,
+        'sAmp': -0.48,
+        'tAmp': 0.16,
+        'rSigma': 0.024,
+        'tCenter': 0.76,
+      },
+      'F' => {
+        'pAmp': 0.12,
+        'qAmp': -0.10,
+        'rAmp': 0.88,
+        'sAmp': -0.24,
+        'tAmp': 0.24,
+        'rSigma': 0.018,
+        'tCenter': 0.73,
+      },
+      'Q' => {
+        'pAmp': 0.09,
+        'qAmp': -0.08,
+        'rAmp': 0.72,
+        'sAmp': -0.20,
+        'tAmp': 0.18,
+        'rSigma': 0.017,
+        'tCenter': 0.74,
+      },
+      _ => {
+        'pAmp': 0.14,
+        'qAmp': -0.12,
+        'rAmp': 1.00,
+        'sAmp': -0.30,
+        'tAmp': 0.32,
+        'rSigma': 0.014,
+        'tCenter': 0.73,
+      },
+    };
+
+    double gaussian(double x, double center, double sigma, double amplitude) {
+      final variance = sigma * sigma * 2;
+      return amplitude * exp(-pow(x - center, 2) / variance);
+    }
+
+    final samples = List<double>.generate(sampleCount, (i) {
+      final x = i / (sampleCount - 1);
+      final baseline = 0.01 * sin(x * pi * 2.2);
+      return baseline +
+          gaussian(x, 0.18, 0.045, profile['pAmp']!) +
+          gaussian(x, 0.37, 0.014, profile['qAmp']!) +
+          gaussian(x, 0.40, profile['rSigma']!, profile['rAmp']!) +
+          gaussian(x, 0.435, 0.016, profile['sAmp']!) +
+          gaussian(x, profile['tCenter']!, 0.085, profile['tAmp']!);
+    });
+
+    final normalized = _normalizeEcgSamples(samples);
+    return ChartBeatFrame(
+      samples: normalized,
+      rPeakIndex: _findRPeakIndex(normalized),
+      shortClass: shortClass,
+    );
+  }
+
+  List<double> _normalizeEcgSamples(List<double> raw) {
+    if (raw.isEmpty) return const [0.0];
+
+    final mean = raw.reduce((a, b) => a + b) / raw.length;
+    final centered = [for (final value in raw) value - mean];
+    final maxAbs = centered.fold<double>(
+      0.0,
+      (best, value) => max(best, value.abs()),
+    );
+    if (maxAbs < 1e-6) return List<double>.filled(raw.length, 0.0);
+
+    final normalized = [for (final value in centered) (value / maxAbs) * 0.98];
+    return List<double>.generate(normalized.length, (i) {
+      if (i == 0 || i == normalized.length - 1) return normalized[i];
+      return (normalized[i - 1] * 0.08) +
+          (normalized[i] * 0.84) +
+          (normalized[i + 1] * 0.08);
+    });
+  }
+
+  List<double> _resampleSignal(List<double> source, int targetLength) {
+    if (source.isEmpty) return List<double>.filled(targetLength, 0.0);
+    if (source.length == 1) {
+      return List<double>.filled(targetLength, source.first);
+    }
+    if (source.length == targetLength) return List<double>.from(source);
+
+    return List<double>.generate(targetLength, (i) {
+      final position = (i * (source.length - 1)) / (targetLength - 1);
+      final left = position.floor();
+      final right = min(source.length - 1, left + 1);
+      final fraction = position - left;
+      return (source[left] * (1 - fraction)) + (source[right] * fraction);
+    });
+  }
+
+  int _findRPeakIndex(List<double> samples) {
+    if (samples.isEmpty) return 0;
+    int bestIndex = 0;
+    double bestValue = samples.first;
+    for (int i = 1; i < samples.length; i++) {
+      if (samples[i] > bestValue) {
+        bestValue = samples[i];
+        bestIndex = i;
+      }
+    }
+    return bestIndex;
+  }
+
+  ChartBeatFrame? _previewChartBeatFrame() {
+    if (_isSimulationMode && _evaluationRows.isNotEmpty) {
+      final previewIndex = min(_currentEvalIndex, _evaluationRows.length - 1);
+      final row = _evaluationRows[previewIndex];
+      final shortClass = _lastPredictionShort != '—'
+          ? _lastPredictionShort
+          : row.gtClassShort;
+      return _buildCsvChartBeatFrame(row, shortClass);
+    }
+
+    if (!_isSimulationMode && _lastPredictionShort != '—') {
+      return _buildSyntheticChartBeatFrame(
+        shortClass: _lastPredictionShort,
+        rrMs: _rrIntervalMs,
+      );
+    }
+
+    return null;
+  }
+
+  ChartSeriesData _buildChartSeriesData() {
+    final previewFrame = _previewChartBeatFrame();
+    final frames = _chartBeatFrames.isNotEmpty
+        ? _chartBeatFrames
+        : (previewFrame == null ? const <ChartBeatFrame>[] : [previewFrame]);
+
+    if (frames.isEmpty) {
+      return const ChartSeriesData(spots: [], beatTags: []);
+    }
+
+    final spots = <FlSpot>[];
+    final beatTags = <BluetoothBeatTag>[];
+    int cursor = 0;
+
+    for (int frameIndex = 0; frameIndex < frames.length; frameIndex++) {
+      final frame = frames[frameIndex];
+      for (int i = 0; i < frame.samples.length; i++) {
+        spots.add(FlSpot((cursor + i).toDouble(), frame.samples[i]));
+      }
+
+      beatTags.add(
+        BluetoothBeatTag(
+          sampleIndex: cursor + frame.rPeakIndex,
+          shortClass: frame.shortClass,
+        ),
+      );
+
+      cursor += frame.samples.length;
+      if (frameIndex == frames.length - 1) continue;
+
+      for (int gap = 0; gap < _chartBeatGapSamples; gap++) {
+        spots.add(FlSpot((cursor + gap).toDouble(), 0.0));
+      }
+      cursor += _chartBeatGapSamples;
+    }
+
+    return ChartSeriesData(spots: spots, beatTags: beatTags);
+  }
+
+  double _chartMinYFor(List<FlSpot> spots) {
+    if (spots.isEmpty) return -1.15;
+    final minValue = spots
+        .map((spot) => spot.y)
+        .reduce((value, next) => min(value, next));
+    return minValue - 0.18;
+  }
+
+  double _chartMaxYFor(List<FlSpot> spots) {
+    if (spots.isEmpty) return 1.2;
+    final maxValue = spots
+        .map((spot) => spot.y)
+        .reduce((value, next) => max(value, next));
+    return maxValue + 0.28;
+  }
+
+  List<Widget> _buildBeatClassOverlays({
+    required double chartWidth,
+    required double chartHeight,
+    required List<FlSpot> spots,
+    required List<BluetoothBeatTag> beatTags,
+    required double minY,
+    required double maxY,
+  }) {
+    if (spots.isEmpty || beatTags.isEmpty) {
+      return const [];
+    }
+
+    final xMax = max(1, spots.length - 1).toDouble();
+    final ySpan = max(0.001, maxY - minY);
+    final overlays = <Widget>[];
+
+    for (final tag in beatTags) {
+      final localIndex = tag.sampleIndex;
+      if (localIndex < 0 || localIndex >= spots.length) {
+        continue;
+      }
+
+      final spot = spots[localIndex];
+      final dx = (spot.x / xMax) * chartWidth;
+      final normalizedY = (maxY - spot.y) / ySpan;
+      final dy = (normalizedY * chartHeight) - 28;
+
+      overlays.add(
+        Positioned(
+          left: dx - 14,
+          top: dy.clamp(4.0, chartHeight - 34.0).toDouble(),
+          child: _SignalClassBadge(shortClass: tag.shortClass),
+        ),
+      );
+    }
+
+    return overlays;
   }
 
   int get _totalBeats => _classCounts.values.fold(0, (a, b) => a + b);
 
+  String get _groundTruthLabel {
+    if (!_isSimulationMode) return 'Tidak digunakan pada mode Bluetooth';
+
+    if (_currentGroundTruthShort == '—' || _currentGroundTruthLong == '—') {
+      return '—';
+    }
+    return '$_currentGroundTruthLong ($_currentGroundTruthShort)';
+  }
+
+  String get _groundTruthCaption {
+    if (!_isSimulationMode) {
+      return 'Ground truth hanya digunakan pada mode evaluasi CSV, bukan mode Bluetooth.';
+    }
+
+    return 'Ground truth berasal dari file CSV evaluasi yang di-upload pengguna.';
+  }
+
+  String get _bluetoothReferenceLabel {
+    if (_isSimulationMode) {
+      return '—';
+    }
+
+    final hrText = _heartRate > 0 ? 'HR $_heartRate bpm' : 'HR —';
+    final rrText = _rrIntervalMs > 0 ? 'RR $_rrIntervalMs ms' : 'RR —';
+    final liveDominant = _dominantClassFromCounts(_classCounts);
+    return '$hrText · $rrText · Distribusi dominan sesi $liveDominant';
+  }
 
   String get _modeLabel {
     if (_isPolarConnected && !_isSimulationMode) {
@@ -1481,10 +2394,15 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     }
 
     if (_isSimulationMode) {
-      return 'SIMULASI ECG';
+      return 'EVALUASI CSV';
     }
 
     return 'MONITORING ECG';
+  }
+
+  String _shortFileName(String name) {
+    if (name.length <= 22) return name;
+    return '${name.substring(0, 19)}...';
   }
 
   Color _predictionAccent(String shortClass) {
@@ -1516,8 +2434,76 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     }
   }
 
-  double get _chartMinY => _isSimulationMode ? -1.2 : 40.0;
-  double get _chartMaxY => _isSimulationMode ? 1.4 : 180.0;
+  Map<String, int> get _referenceDatasetCounts {
+    final counts = {
+      'Normal': 0,
+      'SVEB': 0,
+      'VEB': 0,
+      'Fusion': 0,
+      'Unknown': 0,
+    };
+
+    for (final row in _evaluationRows) {
+      final key = row.gtClassName;
+      if (counts.containsKey(key)) {
+        counts[key] = counts[key]! + 1;
+      }
+    }
+
+    return counts;
+  }
+
+  int get _referenceDatasetTotal {
+    return _referenceDatasetCounts.values.fold(0, (a, b) => a + b);
+  }
+
+  String _dominantClassFromCounts(Map<String, int> counts) {
+    String bestClass = '—';
+    int bestCount = -1;
+
+    counts.forEach((key, value) {
+      if (value > bestCount) {
+        bestClass = key;
+        bestCount = value;
+      }
+    });
+
+    return bestClass;
+  }
+
+  double _classPercent(Map<String, int> counts, String className) {
+    final total = counts.values.fold(0, (a, b) => a + b);
+    if (total == 0) return 0.0;
+    return ((counts[className] ?? 0) / total) * 100.0;
+  }
+
+  String get _bluetoothDatasetReferenceLabel {
+    if (_evaluationRows.isEmpty) {
+      return 'Dataset referensi belum di-upload';
+    }
+
+    final dominant = _dominantClassFromCounts(_referenceDatasetCounts);
+    final percent = _classPercent(_referenceDatasetCounts, dominant);
+    final fileName = _uploadedCsvName ?? 'CSV referensi';
+
+    return '$fileName · Dominan $dominant (${percent.toStringAsFixed(1)}%)';
+  }
+
+  String get _bluetoothComparisonCaption {
+    if (_evaluationRows.isEmpty) {
+      return 'Belum ada dataset referensi yang di-upload, sehingga justifikasi Bluetooth masih terbatas pada hasil live sensor.';
+    }
+
+    final liveDominant = _dominantClassFromCounts(_classCounts);
+    final refDominant = _dominantClassFromCounts(_referenceDatasetCounts);
+    final livePercent = _classPercent(_classCounts, liveDominant);
+    final refPercent = _classPercent(_referenceDatasetCounts, refDominant);
+
+    return 'Sesi Bluetooth dibandingkan secara agregat dengan dataset referensi yang di-upload. '
+        'Distribusi live didominasi $liveDominant (${livePercent.toStringAsFixed(1)}%), '
+        'sedangkan dataset referensi didominasi $refDominant (${refPercent.toStringAsFixed(1)}%). '
+        'Perbandingan ini dipakai sebagai justifikasi pola, bukan ground truth beat-per-beat.';
+  }
 
   @override
   void dispose() {
@@ -1525,6 +2511,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     _inferenceTimer?.cancel();
     _sessionTimer?.cancel();
     _cpuTimer?.cancel();
+    _calibrationTimer?.cancel();
 
     _adapterStateSub?.cancel();
     _scanResultsSub?.cancel();
@@ -1575,15 +2562,11 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
         padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
         decoration: const BoxDecoration(
           color: T.bg,
-          border: Border(
-            top: BorderSide(color: T.brd),
-          ),
+          border: Border(top: BorderSide(color: T.brd)),
         ),
         child: Row(
           children: [
-            Expanded(
-              child: _RefreshButton(onTap: _refreshSensorFlow),
-            ),
+            Expanded(child: _RefreshButton(onTap: _refreshSensorFlow)),
             const SizedBox(width: 12),
             _ActionButton(
               isRunning: _isRunning,
@@ -1602,6 +2585,11 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
   }
 
   Widget _buildSignalCard() {
+    final chartData = _buildChartSeriesData();
+    final chartSpots = chartData.spots;
+    final minY = _chartMinYFor(chartSpots);
+    final maxY = _chartMaxYFor(chartSpots);
+
     return _Panel(
       padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
       child: Column(
@@ -1627,60 +2615,136 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
           ),
           const SizedBox(height: 12),
           Container(
-            height: 198,
+            height: _isSimulationMode ? 198 : 228,
             decoration: BoxDecoration(
               color: T.card2,
               borderRadius: BorderRadius.circular(14),
               border: Border.all(color: T.brd),
             ),
-            padding: const EdgeInsets.fromLTRB(10, 10, 10, 8),
-            child: LineChart(
-              LineChartData(
-                minX: 0,
-                maxX: (_signalBuffer.length - 1).toDouble(),
-                minY: _chartMinY,
-                maxY: _chartMaxY,
-                clipData: const FlClipData.all(),
-                lineTouchData: const LineTouchData(enabled: false),
-                gridData: FlGridData(
-                  show: true,
-                  drawVerticalLine: true,
-                  verticalInterval: _isSimulationMode ? 32 : 20,
-                  horizontalInterval: _isSimulationMode ? 0.5 : 20,
-                  getDrawingHorizontalLine: (_) => const FlLine(
-                    color: Color(0x12FFFFFF),
-                    strokeWidth: 0.5,
-                  ),
-                  getDrawingVerticalLine: (_) => const FlLine(
-                    color: Color(0x12FFFFFF),
-                    strokeWidth: 0.5,
+            child: Column(
+              children: [
+                Expanded(
+                  child: LayoutBuilder(
+                    builder: (context, constraints) {
+                      final chartWidth = _isSimulationMode
+                          ? constraints.maxWidth
+                          : max(
+                              constraints.maxWidth,
+                              max(560.0, chartSpots.length * 1.8),
+                            );
+
+                      final chart = SizedBox(
+                        width: chartWidth,
+                        height: constraints.maxHeight,
+                        child: Stack(
+                          children: [
+                            LineChart(
+                              LineChartData(
+                                minX: 0,
+                                maxX: max(0, chartSpots.length - 1).toDouble(),
+                                minY: minY,
+                                maxY: maxY,
+                                clipData: const FlClipData.all(),
+                                lineTouchData: const LineTouchData(
+                                  enabled: false,
+                                ),
+                                gridData: FlGridData(
+                                  show: true,
+                                  drawVerticalLine: true,
+                                  verticalInterval: _isSimulationMode ? 24 : 14,
+                                  horizontalInterval: 0.25,
+                                  getDrawingHorizontalLine: (_) => const FlLine(
+                                    color: Color(0x12FFFFFF),
+                                    strokeWidth: 0.5,
+                                  ),
+                                  getDrawingVerticalLine: (_) => const FlLine(
+                                    color: Color(0x12FFFFFF),
+                                    strokeWidth: 0.5,
+                                  ),
+                                ),
+                                titlesData: const FlTitlesData(show: false),
+                                borderData: FlBorderData(
+                                  show: true,
+                                  border: Border.all(
+                                    color: const Color(0x18FFFFFF),
+                                  ),
+                                ),
+                                lineBarsData: [
+                                  LineChartBarData(
+                                    spots: chartSpots,
+                                    isCurved: false,
+                                    curveSmoothness: 0,
+                                    color: T.green,
+                                    barWidth: _isSimulationMode ? 2.1 : 2.0,
+                                    isStrokeCapRound: false,
+                                    dotData: const FlDotData(show: false),
+                                    belowBarData: BarAreaData(
+                                      show: true,
+                                      gradient: const LinearGradient(
+                                        begin: Alignment.topCenter,
+                                        end: Alignment.bottomCenter,
+                                        colors: [
+                                          Color(0x2600D09E),
+                                          Color(0x0400D09E),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              duration: Duration.zero,
+                              curve: Curves.linear,
+                            ),
+                            ..._buildBeatClassOverlays(
+                              chartWidth: chartWidth,
+                              chartHeight: constraints.maxHeight,
+                              spots: chartSpots,
+                              beatTags: chartData.beatTags,
+                              minY: minY,
+                              maxY: maxY,
+                            ),
+                          ],
+                        ),
+                      );
+
+                      if (_isSimulationMode) {
+                        return chart;
+                      }
+
+                      return SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        reverse: true,
+                        physics: const BouncingScrollPhysics(),
+                        child: chart,
+                      );
+                    },
                   ),
                 ),
-                titlesData: const FlTitlesData(show: false),
-                borderData: FlBorderData(
-                  show: true,
-                  border: Border.all(color: const Color(0x18FFFFFF)),
-                ),
-                lineBarsData: [
-                  LineChartBarData(
-                    spots: _buildSpots(),
-                    isCurved: false,
-                    color: T.green,
-                    barWidth: 1.8,
-                    dotData: const FlDotData(show: false),
-                    belowBarData: BarAreaData(
-                      show: true,
-                      gradient: const LinearGradient(
-                        begin: Alignment.topCenter,
-                        end: Alignment.bottomCenter,
-                        colors: [Color(0x2200D09E), Color(0x0000D09E)],
+                if (!_isSimulationMode) ...[
+                  const SizedBox(height: 10),
+                  const Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(Icons.chevron_left_rounded, color: T.txt2, size: 18),
+                      SizedBox(width: 4),
+                      Text(
+                        'Geser untuk melihat sinyal',
+                        style: TextStyle(
+                          color: T.txt2,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                        ),
                       ),
-                    ),
+                      SizedBox(width: 4),
+                      Icon(
+                        Icons.chevron_right_rounded,
+                        color: T.txt2,
+                        size: 18,
+                      ),
+                    ],
                   ),
                 ],
-              ),
-              duration: Duration.zero,
-              curve: Curves.linear,
+              ],
             ),
           ),
         ],
@@ -1728,24 +2792,39 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
   Widget _buildHeroSummary() {
     final hasPrediction =
         _lastPredictionShort != '—' && _lastPredictionShort.isNotEmpty;
-    final accent =
-        hasPrediction ? _predictionAccent(_lastPredictionShort) : T.blue;
-    final dimAccent =
-        hasPrediction ? _predictionDimAccent(_lastPredictionShort) : T.blueDim;
+    final accent = hasPrediction
+        ? _predictionAccent(_lastPredictionShort)
+        : T.blue;
+    final dimAccent = hasPrediction
+        ? _predictionDimAccent(_lastPredictionShort)
+        : T.blueDim;
     final brdAccent = hasPrediction
         ? _predictionBorderAccent(_lastPredictionShort)
         : T.blueBrd;
 
-    final rightLabel = 'Klasifikasi Detak';
+    final leftLabel = _isSimulationMode ? 'Sampel diproses' : 'Detak jantung';
+    final leftValue = _isSimulationMode
+        ? '$_evalTotal'
+        : (_heartRate > 0 ? '$_heartRate' : '—');
+    final leftFooter = _isSimulationMode
+        ? '/ ${_evaluationRows.length}'
+        : 'detak / menit';
+    final leftColor = _isSimulationMode ? T.green : T.red;
+
+    final rightLabel = _isSimulationMode
+        ? 'Prediksi Model'
+        : 'Klasifikasi Detak';
     final rightShort = hasPrediction ? _lastPredictionShort : '—';
     final rightValue = hasPrediction ? _lastPredictionClass : 'Menunggu data';
     final rightFooter = _isSimulationMode
-        ? (_predictionConfidence > 0
-              ? 'Confidence ${(100 * _predictionConfidence).toStringAsFixed(1)}%'
-              : 'Menunggu inferensi')
+        ? (_evalTotal > 0
+              ? 'GT $_currentGroundTruthShort · Acc ${(100 * _evalAccuracy).toStringAsFixed(1)}%'
+              : 'Menunggu inferensi dari CSV')
         : (hasPrediction
               ? 'Live dari paket data sensor terbaru'
-              : 'Menunggu paket data dari sensor');
+              : (_isCalibrating
+                    ? 'Stabilisasi $_calibrationSecondsLeft detik'
+                    : 'Menunggu paket data dari sensor'));
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -1761,19 +2840,19 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const _Label('Detak jantung'),
+                _Label(leftLabel),
                 const SizedBox(height: 4),
                 Text(
-                  _heartRate > 0 ? '$_heartRate' : '—',
-                  style: const TextStyle(
-                    color: T.red,
+                  leftValue,
+                  style: TextStyle(
+                    color: leftColor,
                     fontSize: 34,
                     fontWeight: FontWeight.w700,
                   ),
                 ),
-                const Text(
-                  'detak / menit',
-                  style: TextStyle(color: T.txt2, fontSize: 11),
+                Text(
+                  leftFooter,
+                  style: const TextStyle(color: T.txt2, fontSize: 11),
                 ),
               ],
             ),
@@ -1842,15 +2921,154 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     );
   }
 
-
-
   Widget _buildSessionPanel() {
-    final leftLabel = _isSimulationMode ? 'Total detak' : 'Paket HR';
-    final rightLabel = _isSimulationMode ? 'Puncak R' : 'RR interval';
-    final leftValue = _isSimulationMode ? '$_totalBeats' : '$_hrPacketCount';
-    final rightValue = _isSimulationMode
-        ? '$_detectedRPeaks'
-        : (_rrIntervalMs > 0 ? '$_rrIntervalMs ms' : '—');
+    if (_isSimulationMode) {
+      return _Panel(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Container(
+                  width: 34,
+                  height: 34,
+                  decoration: BoxDecoration(
+                    color: T.greenDim,
+                    borderRadius: BorderRadius.circular(9),
+                    border: Border.all(color: T.greenBrd),
+                  ),
+                  child: const Icon(
+                    Icons.timer_outlined,
+                    color: T.green,
+                    size: 17,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const _Label('Durasi sesi'),
+                    Text(
+                      _duration,
+                      style: const TextStyle(
+                        color: T.txt,
+                        fontSize: 24,
+                        fontWeight: FontWeight.w700,
+                        fontFeatures: [FontFeature.tabularFigures()],
+                      ),
+                    ),
+                  ],
+                ),
+                const Spacer(),
+              ],
+            ),
+            const SizedBox(height: 14),
+            Row(
+              children: [
+                Expanded(
+                  child: _MiniStat(
+                    label: 'Total sampel',
+                    value: '${_evaluationRows.length}',
+                    accent: true,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: _MiniStat(
+                    label: 'Diproses',
+                    value: '$_evalTotal',
+                    accent: true,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: _MiniStat(
+                    label: 'Benar',
+                    value: '$_evalCorrect',
+                    accent: _evalCorrect > 0,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: _MiniStat(
+                    label: 'Salah',
+                    value: '$_evalWrong',
+                    accent: _evalWrong > 0,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: _MiniStat(
+                    label: 'Akurasi',
+                    value: _evalTotal > 0
+                        ? '${(_evalAccuracy * 100).toStringAsFixed(1)}%'
+                        : '—',
+                    accent: _evalTotal > 0,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: _MiniStat(
+                    label: 'Ground truth',
+                    value: _currentGroundTruthShort,
+                    accent: _currentGroundTruthShort != '—',
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: _MiniStat(
+                    label: 'Inferensi',
+                    value: _lastInferenceMs > 0
+                        ? '${_lastInferenceMs.toStringAsFixed(2)} ms'
+                        : '—',
+                    accent: _lastInferenceMs > 0,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: _MiniStat(
+                    label: 'CPU prediksi',
+                    value: _formatCpuValue(
+                      _lastCpuAtInference,
+                      decimals: 1,
+                      compact: true,
+                    ),
+                    accent: _isValidCpuUsage(_lastCpuAtInference),
+                  ),
+                ),
+              ],
+            ),
+            if (_uploadedCsvName != null) ...[
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                child: _MiniInfoTile(
+                  label: 'File CSV',
+                  value: _uploadedCsvName!,
+                ),
+              ),
+            ],
+          ],
+        ),
+      );
+    }
+
+    final leftLabel = 'Paket HR';
+    final rightLabel = 'RR interval';
+    final leftValue = '$_hrPacketCount';
+    final rightValue = _rrIntervalMs > 0 ? '$_rrIntervalMs ms' : '—';
 
     return _Panel(
       child: Column(
@@ -1888,6 +3106,27 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                   ),
                 ],
               ),
+              const Spacer(),
+              if (_isCalibrating)
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 10,
+                    vertical: 6,
+                  ),
+                  decoration: BoxDecoration(
+                    color: T.amberDim,
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(color: T.amberBrd),
+                  ),
+                  child: Text(
+                    'Stabilisasi $_calibrationSecondsLeft dtk',
+                    style: const TextStyle(
+                      color: T.amber,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
             ],
           ),
           const SizedBox(height: 14),
@@ -1915,25 +3154,43 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
             children: [
               Expanded(
                 child: _MiniStat(
-                  label: _isSimulationMode ? 'Jumlah inferensi' : 'Klasifikasi',
-                  value: _isSimulationMode
-                      ? '$_totalInferenceRuns'
-                      : _lastPredictionShort,
-                  accent: _isSimulationMode || _lastPredictionShort != '—',
+                  label: 'Klasifikasi',
+                  value: _lastPredictionShort,
+                  accent: _lastPredictionShort != '—',
                 ),
               ),
               const SizedBox(width: 8),
               Expanded(
                 child: _MiniStat(
-                  label: _isSimulationMode ? 'Confidence' : 'Status sensor',
-                  value: _isSimulationMode
-                      ? (_predictionConfidence > 0
-                            ? '${(100 * _predictionConfidence).toStringAsFixed(1)}%'
-                            : '—')
-                      : (_isPolarConnected ? 'Tersambung' : 'Belum tersambung'),
-                  accent: _isSimulationMode
-                      ? _predictionConfidence > 0
-                      : _isPolarConnected,
+                  label: 'Status sensor',
+                  value: _isPolarConnected ? 'Tersambung' : '—',
+                  accent: _isPolarConnected,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: _MiniStat(
+                  label: 'Inferensi',
+                  value: _lastInferenceMs > 0
+                      ? '${_lastInferenceMs.toStringAsFixed(2)} ms'
+                      : '—',
+                  accent: _lastInferenceMs > 0,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _MiniStat(
+                  label: 'CPU prediksi',
+                  value: _formatCpuValue(
+                    _lastCpuAtInference,
+                    decimals: 1,
+                    compact: true,
+                  ),
+                  accent: _isValidCpuUsage(_lastCpuAtInference),
                 ),
               ),
             ],
@@ -1944,69 +3201,116 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
   }
 
   Widget _buildDebugPanel() {
+    final debugChildren = <Widget>[
+      _Chip(label: 'Model', active: _interpreter != null),
+      _Chip(label: 'Bluetooth', active: _isPolarConnected),
+      _Chip(
+        label: 'Adapter ${_adapterState.name}',
+        active: _adapterState == BluetoothAdapterState.on,
+      ),
+      _Chip(label: 'Evaluasi CSV', active: _isSimulationMode),
+      _Chip(label: 'Running', active: _isRunning),
+    ];
+
+    if (_isSimulationMode) {
+      debugChildren.add(_Chip(label: 'CSV', active: _hasUploadedCsv));
+      if (_uploadedCsvName != null) {
+        debugChildren.add(
+          _Chip(label: _shortFileName(_uploadedCsvName!), active: true),
+        );
+      }
+      debugChildren.add(
+        _Chip(
+          label: 'Row $_evalTotal/${_evaluationRows.length}',
+          active: _hasUploadedCsv,
+        ),
+      );
+      if (_currentGroundTruthShort != '—') {
+        debugChildren.add(
+          _Chip(label: 'GT $_currentGroundTruthShort', active: true),
+        );
+      }
+      if (_lastPredictionShort != '—') {
+        debugChildren.add(
+          _Chip(label: 'Pred $_lastPredictionShort', active: true),
+        );
+      }
+      debugChildren.add(
+        _Chip(label: 'Benar $_evalCorrect', active: _evalCorrect > 0),
+      );
+      debugChildren.add(
+        _Chip(label: 'Salah $_evalWrong', active: _evalWrong > 0),
+      );
+      if (_evalTotal > 0) {
+        debugChildren.add(
+          _Chip(
+            label: 'Acc ${(100 * _evalAccuracy).toStringAsFixed(1)}%',
+            active: true,
+          ),
+        );
+      }
+    } else {
+      debugChildren.add(
+        _Chip(label: 'HR $_heartRate bpm', active: _heartRate > 0),
+      );
+      debugChildren.add(
+        _Chip(label: 'RR $_rrIntervalMs ms', active: _rrIntervalMs > 0),
+      );
+      debugChildren.add(_Chip(label: 'Pkt $_hrPacketCount', active: true));
+      if (_lastPredictionShort != '—') {
+        debugChildren.add(
+          _Chip(label: 'Kls $_lastPredictionShort', active: true),
+        );
+      }
+    }
+
     return _Panel(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const _PanelTitle('Debug pipeline'),
-          Wrap(
-            spacing: 6,
-            runSpacing: 6,
-            children: [
-              _Chip(label: 'Model', active: _interpreter != null),
-              _Chip(label: 'Bluetooth', active: _isPolarConnected),
-              _Chip(
-                label: 'Adapter ${_adapterState.name}',
-                active: _adapterState == BluetoothAdapterState.on,
-              ),
-              _Chip(label: 'Simulasi', active: _isSimulationMode),
-              _Chip(label: 'Running', active: _isRunning),
-              if (_isSimulationMode) ...[
-                const _Chip(label: 'Buf 180', active: true),
-                _Chip(label: 'Puncak R $_detectedRPeaks', active: true),
-                _Chip(label: 'Detak $_beatsProcessed', active: true),
-                if (_lastPredictionShort != '—')
-                  _Chip(
-                    label: 'Pred $_lastPredictionShort',
-                    active: true,
-                  ),
-              ] else ...[
-                _Chip(label: 'HR $_heartRate bpm', active: _heartRate > 0),
-                _Chip(label: 'RR $_rrIntervalMs ms', active: _rrIntervalMs > 0),
-                _Chip(label: 'Pkt $_hrPacketCount', active: true),
-                if (_lastPredictionShort != '—')
-                  _Chip(label: 'Kls $_lastPredictionShort', active: true),
-              ],
-            ],
-          ),
+          Wrap(spacing: 6, runSpacing: 6, children: debugChildren),
         ],
       ),
     );
   }
 
   Widget _buildLatencyPanel() {
+    final hasInferenceMetrics = _totalInferenceRuns > 0;
+    final throughputLabel = _sessionSeconds > 0
+        ? '${_throughput.toStringAsFixed(2)} inf/dtk'
+        : '—';
+
     return _Panel(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const _PanelTitle('Waktu inferensi model'),
+          const _PanelTitle('Performa inferensi model'),
           _MetricRow(
-            'Rata-rata',
-            _isSimulationMode ? '${_latencyAvg.toStringAsFixed(3)} md' : '—',
+            'Waktu inferensi terakhir',
+            hasInferenceMetrics
+                ? '${_lastInferenceMs.toStringAsFixed(3)} ms'
+                : '—',
+          ),
+          _MetricRow(
+            'CPU saat prediksi terakhir',
+            hasInferenceMetrics ? _formatCpuValue(_lastCpuAtInference) : '—',
+          ),
+          _MetricRow(
+            'Rata-rata waktu inferensi',
+            hasInferenceMetrics ? '${_latencyAvg.toStringAsFixed(3)} ms' : '—',
           ),
           _MetricRow(
             'Minimum',
-            _isSimulationMode ? '${_latencyMin.toStringAsFixed(3)} md' : '—',
+            hasInferenceMetrics ? '${_latencyMin.toStringAsFixed(3)} ms' : '—',
           ),
           _MetricRow(
             'Maksimum',
-            _isSimulationMode ? '${_latencyMax.toStringAsFixed(3)} md' : '—',
+            hasInferenceMetrics ? '${_latencyMax.toStringAsFixed(3)} ms' : '—',
           ),
           _MetricRow(
             'Laju pemrosesan',
-            _isSimulationMode && _sessionSeconds > 0
-                ? '${_throughput.toStringAsFixed(2)} inf/dtk'
-                : '—',
+            hasInferenceMetrics ? throughputLabel : '—',
             last: true,
           ),
         ],
@@ -2020,12 +3324,19 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const _PanelTitle('Penggunaan sumber daya'),
-          _MetricRow('Penggunaan RAM', '${_ramCurrentMb.toStringAsFixed(2)} MB'),
+          _MetricRow(
+            'Penggunaan RAM',
+            '${_ramCurrentMb.toStringAsFixed(2)} MB',
+          ),
           _MetricRow('RAM minimum', '${_ramMinMb.toStringAsFixed(2)} MB'),
           _MetricRow('RAM maksimum', '${_ramMaxMb.toStringAsFixed(2)} MB'),
-          _MetricRow('Penggunaan CPU', '${_cpuCurrent.toStringAsFixed(2)} %'),
-          _MetricRow('CPU minimum', '${_cpuMin.toStringAsFixed(2)} %'),
-          _MetricRow('CPU maksimum', '${_cpuMax.toStringAsFixed(2)} %'),
+          _MetricRow('Penggunaan CPU', _formatCpuValue(_cpuCurrent)),
+          _MetricRow(
+            'CPU saat prediksi terakhir',
+            _formatCpuValue(_lastCpuAtInference),
+          ),
+          _MetricRow('CPU minimum', _formatCpuValue(_cpuMin)),
+          _MetricRow('CPU maksimum', _formatCpuValue(_cpuMax)),
           _MetricRow(
             'Sensor',
             _isPolarConnected ? _sensorName : 'Tidak terdeteksi',
@@ -2089,11 +3400,7 @@ class _Label extends StatelessWidget {
   Widget build(BuildContext context) {
     return Text(
       text.toUpperCase(),
-      style: const TextStyle(
-        color: T.txt2,
-        fontSize: 10,
-        letterSpacing: 1.2,
-      ),
+      style: const TextStyle(color: T.txt2, fontSize: 10, letterSpacing: 1.2),
     );
   }
 }
@@ -2112,6 +3419,7 @@ class _MiniStat extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
+      width: double.infinity,
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       decoration: BoxDecoration(
         color: T.card2,
@@ -2138,10 +3446,7 @@ class _MiniStat extends StatelessWidget {
 }
 
 class _MiniInfoTile extends StatelessWidget {
-  const _MiniInfoTile({
-    required this.label,
-    required this.value,
-  });
+  const _MiniInfoTile({required this.label, required this.value});
 
   final String label;
   final String value;
@@ -2191,9 +3496,7 @@ class _MetricRow extends StatelessWidget {
       decoration: BoxDecoration(
         border: last
             ? null
-            : const Border(
-                bottom: BorderSide(color: Color(0x10FFFFFF)),
-              ),
+            : const Border(bottom: BorderSide(color: Color(0x10FFFFFF))),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -2319,6 +3622,44 @@ class _EvalTile extends StatelessWidget {
   }
 }
 
+class _SignalClassBadge extends StatelessWidget {
+  const _SignalClassBadge({required this.shortClass});
+
+  final String shortClass;
+
+  @override
+  Widget build(BuildContext context) {
+    final accent = _beatColors[shortClass] ?? T.green;
+    final border = _beatBrdColors[shortClass] ?? T.greenBrd;
+
+    return Container(
+      width: 28,
+      height: 28,
+      decoration: BoxDecoration(
+        color: accent,
+        shape: BoxShape.circle,
+        border: Border.all(color: border, width: 2),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x30000000),
+            blurRadius: 10,
+            offset: Offset(0, 4),
+          ),
+        ],
+      ),
+      alignment: Alignment.center,
+      child: Text(
+        shortClass,
+        style: const TextStyle(
+          color: T.bg,
+          fontSize: 12,
+          fontWeight: FontWeight.w800,
+        ),
+      ),
+    );
+  }
+}
+
 class _SummaryLine extends StatelessWidget {
   const _SummaryLine(this.label, this.value);
 
@@ -2342,10 +3683,7 @@ class _SummaryLine extends StatelessWidget {
             ),
             TextSpan(
               text: value,
-              style: const TextStyle(
-                color: T.txt,
-                fontWeight: FontWeight.w600,
-              ),
+              style: const TextStyle(color: T.txt, fontWeight: FontWeight.w600),
             ),
           ],
         ),
@@ -2367,15 +3705,13 @@ class _LivePill extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final label = isSimulationMode
-        ? 'TEST'
-        : (isRunning ? 'LIVE' : 'IDLE');
+    final label = isSimulationMode ? 'EVAL' : (isRunning ? 'LIVE' : 'IDLE');
 
     return AnimatedContainer(
       duration: const Duration(milliseconds: 300),
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
       decoration: BoxDecoration(
-        color: isRunning ? T.greenDim : const Color(
+        color: isRunning ? T.greenDim : const Color(0x08FFFFFF),
         borderRadius: BorderRadius.circular(20),
         border: Border.all(
           color: isRunning ? T.greenBrd : const Color(0x18FFFFFF),
@@ -2482,11 +3818,7 @@ class _RefreshButton extends StatelessWidget {
           child: const Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(
-                Icons.refresh_rounded,
-                color: T.txt2,
-                size: 18,
-              ),
+              Icon(Icons.refresh_rounded, color: T.txt2, size: 18),
               SizedBox(width: 10),
               Text(
                 'Ganti Mode',
