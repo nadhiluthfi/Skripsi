@@ -73,11 +73,8 @@ const _beatBrdColors = {
 };
 
 // ─── BLE UUID helpers ──────────────────────────────────────────────────────
-const _heartRateServiceUuid = '180d';
-const _heartRateMeasurementUuid = '2a37';
-
 // ─── Runtime configuration ─────────────────────────────────────────────────
-const int _modelWindowSamples = 180;
+const int _modelWindowSamples = 120;
 const int _signalBufferSamples = 260;
 const int _stabilizationSeconds = 40;
 const int _chartHistoryBeats = 6;
@@ -92,7 +89,6 @@ class EvaluationRow {
   final String gtClassName;
   final String gtClassShort;
   final List<double> raw;
-  final List<double> morph;
 
   const EvaluationRow({
     required this.recordId,
@@ -102,7 +98,6 @@ class EvaluationRow {
     required this.gtClassName,
     required this.gtClassShort,
     required this.raw,
-    required this.morph,
   });
 }
 
@@ -177,6 +172,10 @@ class EcgDashboardPage extends StatefulWidget {
 class _EcgDashboardPageState extends State<EcgDashboardPage>
     with SingleTickerProviderStateMixin {
   static const MethodChannel _perfChannel = MethodChannel('ecg_app/perf');
+  static const MethodChannel _polarChannel = MethodChannel('ecg_app/polar');
+  static const EventChannel _polarEcgEventChannel = EventChannel(
+    'ecg_app/polar_ecg_stream',
+  );
 
   Interpreter? _interpreter;
   Timer? _simulationTimer;
@@ -191,6 +190,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
   StreamSubscription<List<ScanResult>>? _scanResultsSub;
   StreamSubscription<BluetoothConnectionState>? _deviceConnectionSub;
   StreamSubscription<List<int>>? _hrValueSub;
+  StreamSubscription<dynamic>? _polarEventSub;
 
   BluetoothDevice? _polarDevice;
   BluetoothCharacteristic? _hrCharacteristic;
@@ -203,13 +203,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
   bool _isScanningSheetVisible = false;
   bool _isBluetoothOffSheetVisible = false;
 
-  final List<String> _classNames = const [
-    'Normal',
-    'SVEB',
-    'VEB',
-    'Fusion',
-    'Unknown',
-  ];
+  final List<String> _modelClassShort = const ['N', 'S', 'V', 'F', 'Q'];
 
   final Map<String, String> _classShort = const {
     'Normal': 'N',
@@ -262,15 +256,15 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
   String _explanationText = 'Belum ada hasil klasifikasi.';
   double _predictionConfidence = 0.0;
   double _lastInferenceMs = 0.0;
-  double _lastCpuAtInference = 0.0;
+  double _lastCpuAtInference = -1.0;
   String _duration = '00:00';
   String _sensorName = '—';
 
   int _tick = 0;
   int _sessionSeconds = 0;
-  int _heartRate = 0;
-  int _rrIntervalMs = 0;
-  int _hrPacketCount = 0;
+  int _ecgSamplesReceived = 0;
+  int _polarEcgSampleRate = 130;
+  int _estimatedBpm = 0;
   bool _isBluetoothInferenceBusy = false;
   List<ChartBeatFrame> _chartBeatFrames = [];
 
@@ -291,9 +285,9 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
   double _ramMinMb = 0;
   double _ramMaxMb = 0;
 
-  double _cpuCurrent = 0;
-  double _cpuMin = 0;
-  double _cpuMax = 0;
+  double _cpuCurrent = -1.0;
+  double _cpuMin = -1.0;
+  double _cpuMax = -1.0;
 
   double _throughput = 0;
   int _totalInferenceRuns = 0;
@@ -316,6 +310,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
 
     _loadModel();
     _bindBluetoothState();
+    _bindPolarEcgStream();
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _showSourcePicker();
@@ -325,7 +320,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
   Future<void> _loadModel() async {
     try {
       final interpreter = await Interpreter.fromAsset(
-        'assets/model/morphology_transformer_final.tflite',
+        'assets/model/morphology_transformer_130hz.tflite',
       );
       if (!mounted) return;
       setState(() {
@@ -373,8 +368,6 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
         setState(() {
           _isPolarConnected = false;
           _isPolarConnecting = false;
-          _heartRate = 0;
-          _rrIntervalMs = 0;
           _status = state == BluetoothAdapterState.unauthorized
               ? 'Izin Bluetooth belum diberikan'
               : 'Bluetooth sedang mati';
@@ -385,6 +378,240 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
         }
       }
     });
+  }
+
+  void _bindPolarEcgStream() {
+    _polarEventSub?.cancel();
+    _polarEventSub = _polarEcgEventChannel.receiveBroadcastStream().listen(
+      _handlePolarNativeEvent,
+      onError: (error) {
+        if (!mounted) return;
+        setState(() {
+          _isPolarConnecting = false;
+          _status = 'Polar SDK error: $error';
+        });
+      },
+    );
+  }
+
+  void _handlePolarNativeEvent(dynamic event) {
+    if (event is! Map) return;
+
+    final payload = <String, dynamic>{
+      for (final entry in event.entries) entry.key.toString(): entry.value,
+    };
+
+    switch (payload['type']) {
+      case 'status':
+        _handlePolarStatus(payload);
+        break;
+      case 'ecg':
+        _handlePolarEcg(payload);
+        break;
+    }
+  }
+
+  void _handlePolarStatus(Map<String, dynamic> payload) {
+    final status = payload['status']?.toString() ?? '';
+    final deviceName = payload['deviceName']?.toString();
+    final sampleRateValue = payload['sampleRate'];
+    if (sampleRateValue is num) {
+      _polarEcgSampleRate = sampleRateValue.round();
+    }
+
+    if (deviceName != null && deviceName.isNotEmpty) {
+      _sensorName = deviceName;
+    }
+
+    if (!mounted) return;
+
+    switch (status) {
+      case 'scanning':
+        setState(() {
+          _isPolarConnecting = true;
+          _isPolarConnected = false;
+          _status = 'Mencari Polar H10...';
+        });
+        break;
+      case 'connecting':
+        setState(() {
+          _isPolarConnecting = true;
+          _isPolarConnected = false;
+          _status =
+              'Menghubungkan ke ${_sensorName == '—' ? 'Polar H10' : _sensorName}...';
+        });
+        break;
+      case 'connected':
+        _dismissScanningBottomSheet();
+        setState(() {
+          _isPolarConnecting = false;
+          _isPolarConnected = true;
+          _status = 'Sensor terhubung: $_sensorName';
+        });
+        unawaited(_polarChannel.invokeMethod('startEcgStream'));
+        break;
+      case 'online_streaming_ready':
+        setState(() {
+          _status = 'Polar online streaming siap';
+        });
+        unawaited(_polarChannel.invokeMethod('startEcgStream'));
+        break;
+      case 'ecg_starting':
+        setState(() {
+          _isPolarConnected = true;
+          _status = 'Memulai ECG stream Polar H10...';
+        });
+        break;
+      case 'ecg_started':
+        _dismissScanningBottomSheet();
+        setState(() {
+          _isPolarConnecting = false;
+          _isPolarConnected = true;
+          _status = 'ECG stream aktif ($_polarEcgSampleRate Hz)';
+        });
+        break;
+      case 'ecg_stopped':
+        if (!_isSimulationMode) {
+          setState(() {
+            _status = 'ECG stream berhenti';
+          });
+        }
+        break;
+      case 'disconnected':
+        setState(() {
+          _isPolarConnected = false;
+          _isPolarConnecting = false;
+          _status = 'Sensor Bluetooth terputus';
+        });
+        break;
+      case 'error':
+        _dismissScanningBottomSheet();
+        setState(() {
+          _isPolarConnecting = false;
+          _status = payload['message']?.toString() ?? 'Polar SDK error';
+        });
+        break;
+      default:
+        break;
+    }
+  }
+
+  void _handlePolarEcg(Map<String, dynamic> payload) {
+    final sampleRateValue = payload['sampleRate'];
+    if (sampleRateValue is num) {
+      _polarEcgSampleRate = sampleRateValue.round();
+    }
+
+    final rawSamples = payload['samples'];
+    if (rawSamples is! List || rawSamples.isEmpty) return;
+
+    final samples = rawSamples
+        .whereType<num>()
+        .map((value) => value.toDouble())
+        .toList();
+    if (samples.isEmpty) return;
+
+    for (final sample in samples) {
+      _signalBuffer.removeAt(0);
+      _signalBuffer.add(sample);
+    }
+    _ecgSamplesReceived += samples.length;
+    _updateEstimatedBpmFromEcgSamples(samples);
+
+    if (!_isRunning || _isSimulationMode) {
+      if (!mounted) return;
+      setState(() {
+        _status = 'ECG stream aktif ($_polarEcgSampleRate Hz)';
+      });
+      return;
+    }
+
+    if (_isCalibrating) return;
+
+    if (_ecgSamplesReceived < _modelWindowSamples) {
+      if (!mounted) return;
+      setState(() {
+        _status = 'Bluetooth aktif - Menunggu buffer ECG cukup';
+      });
+      return;
+    }
+
+    if (!_isBluetoothInferenceBusy) {
+      unawaited(
+        _runBluetoothInference(
+          fallbackClass: const {'short': 'Q', 'full': 'Unknown'},
+        ),
+      );
+    }
+  }
+
+  void _updateEstimatedBpmFromEcgSamples(List<double> samples) {
+    if (_polarEcgSampleRate <= 0) return;
+
+    final minSamplesForEstimate = min(
+      _signalBuffer.length,
+      max(_modelWindowSamples, _polarEcgSampleRate * 2),
+    );
+    final minPeakDistance = max(1, (_polarEcgSampleRate * 0.35).round());
+
+    for (final sample in samples) {
+      _liveSampleIndex++;
+      final candidateIndex = _liveSampleIndex - 1;
+      final isLocalPeak = _prevLive1 > _prevLive2 && _prevLive1 > sample;
+
+      if (_ecgSamplesReceived >= minSamplesForEstimate &&
+          isLocalPeak &&
+          _isLikelyEcgPeak(_prevLive1) &&
+          candidateIndex - _lastPeakIndex >= minPeakDistance) {
+        _lastPeakIndex = candidateIndex;
+        _recentPeakIndices.add(candidateIndex);
+
+        if (_recentPeakIndices.length > 6) {
+          _recentPeakIndices.removeAt(0);
+        }
+
+        if (_recentPeakIndices.length >= 3) {
+          final intervals = <int>[];
+          for (int i = 1; i < _recentPeakIndices.length; i++) {
+            intervals.add(_recentPeakIndices[i] - _recentPeakIndices[i - 1]);
+          }
+
+          final avgInterval =
+              intervals.reduce((a, b) => a + b) / intervals.length;
+          if (avgInterval > 0) {
+            final bpm = (60.0 * _polarEcgSampleRate / avgInterval).round();
+            if (bpm >= 35 && bpm <= 220) {
+              _estimatedBpm = bpm;
+            }
+          }
+        }
+      }
+
+      _prevLive2 = _prevLive1;
+      _prevLive1 = sample;
+    }
+  }
+
+  bool _isLikelyEcgPeak(double value) {
+    final availableSamples = min(_signalBuffer.length, _ecgSamplesReceived);
+    if (availableSamples < _modelWindowSamples) return false;
+
+    final recent = _signalBuffer.sublist(
+      _signalBuffer.length - availableSamples,
+    );
+    final mean = recent.reduce((a, b) => a + b) / recent.length;
+    final variance =
+        recent
+            .map((sample) {
+              final delta = sample - mean;
+              return delta * delta;
+            })
+            .reduce((a, b) => a + b) /
+        recent.length;
+    final stdDev = sqrt(variance);
+    if (stdDev <= 1e-6) return false;
+
+    return value > mean + (1.2 * stdDev);
   }
 
   Future<void> _requestBlePermissions() async {
@@ -489,33 +716,26 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
 
     int idx(String name) => headers.indexOf(name);
 
-    final recordIdIdx = idx('record_id');
-    final centerSampleIdx = idx('center_sample');
-    final annotationSymbolIdx = idx('annotation_symbol');
-    final gtClassIdIdx = idx('gt_class_id');
-    final gtClassNameIdx = idx('gt_class_name');
-    final gtClassShortIdx = idx('gt_class_short');
+    final recordIdIdx = idx('record');
+    final centerSampleIdx = idx('rpeak_index_130hz');
+    final annotationSymbolIdx = idx('symbol');
+    final gtClassIdIdx = idx('class_index');
+    final gtClassNameIdx = idx('class_name');
 
-    if ([
-      recordIdIdx,
-      centerSampleIdx,
-      annotationSymbolIdx,
-      gtClassIdIdx,
-      gtClassNameIdx,
-      gtClassShortIdx,
-    ].contains(-1)) {
-      throw Exception('Header metadata CSV tidak lengkap');
+    if ([recordIdIdx, gtClassIdIdx, gtClassNameIdx].contains(-1)) {
+      throw Exception(
+        'Header metadata CSV 130 Hz tidak lengkap: perlu record, class_name, dan class_index',
+      );
     }
 
     final rawIndexes = List<int>.generate(
       _modelWindowSamples,
-      (i) => idx('raw_$i'),
+      (i) => idx('sample_${i.toString().padLeft(3, '0')}'),
     );
-    final morphIndexes = List<int>.generate(37, (i) => idx('morph_$i'));
 
-    if (rawIndexes.contains(-1) || morphIndexes.contains(-1)) {
+    if (rawIndexes.contains(-1)) {
       throw Exception(
-        'Kolom raw_0..raw_${_modelWindowSamples - 1} atau morph_0..morph_36 tidak lengkap',
+        'Kolom sample_000..sample_${(_modelWindowSamples - 1).toString().padLeft(3, '0')} tidak lengkap',
       );
     }
 
@@ -529,24 +749,31 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
 
       try {
         final raw = [for (final i in rawIndexes) double.parse(cols[i].trim())];
-        final morph = [
-          for (final i in morphIndexes) double.parse(cols[i].trim()),
-        ];
 
-        if (raw.length != _modelWindowSamples || morph.length != 37) {
+        if (raw.length != _modelWindowSamples) {
           continue;
         }
+
+        final gtClassId = int.tryParse(cols[gtClassIdIdx].trim()) ?? 0;
+        final gtClassShort = _normalizeClassShort(
+          cols[gtClassNameIdx].trim(),
+          fallbackIndex: gtClassId,
+        );
+        final gtClassName = _shortToLong[gtClassShort] ?? 'Unknown';
 
         rows.add(
           EvaluationRow(
             recordId: cols[recordIdIdx].trim(),
-            centerSample: int.tryParse(cols[centerSampleIdx].trim()) ?? 0,
-            annotationSymbol: cols[annotationSymbolIdx].trim(),
-            gtClassId: int.tryParse(cols[gtClassIdIdx].trim()) ?? 0,
-            gtClassName: cols[gtClassNameIdx].trim(),
-            gtClassShort: cols[gtClassShortIdx].trim(),
+            centerSample: centerSampleIdx == -1
+                ? 0
+                : (int.tryParse(cols[centerSampleIdx].trim()) ?? 0),
+            annotationSymbol: annotationSymbolIdx == -1
+                ? gtClassShort
+                : cols[annotationSymbolIdx].trim(),
+            gtClassId: gtClassId,
+            gtClassName: gtClassName,
+            gtClassShort: gtClassShort,
             raw: raw,
-            morph: morph,
           ),
         );
       } catch (_) {
@@ -555,6 +782,24 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     }
 
     return rows;
+  }
+
+  String _normalizeClassShort(String value, {int? fallbackIndex}) {
+    final upper = value.trim().toUpperCase();
+
+    if (_shortToLong.containsKey(upper)) return upper;
+
+    for (final entry in _classShort.entries) {
+      if (entry.key.toUpperCase() == upper) return entry.value;
+    }
+
+    if (fallbackIndex != null &&
+        fallbackIndex >= 0 &&
+        fallbackIndex < _modelClassShort.length) {
+      return _modelClassShort[fallbackIndex];
+    }
+
+    return 'Q';
   }
 
   void _loadRowIntoSignalBuffer(EvaluationRow row) {
@@ -690,205 +935,26 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
 
     try {
       await _disconnectPolarSensor(resetMode: false);
-      await FlutterBluePlus.stopScan();
-
-      final completer = Completer<ScanResult>();
-
-      _scanResultsSub?.cancel();
-      _scanResultsSub = FlutterBluePlus.scanResults.listen((results) {
-        for (final result in results) {
-          final advName = result.advertisementData.advName;
-          final platformName = result.device.platformName;
-          final candidateName = advName.isNotEmpty ? advName : platformName;
-
-          final lower = candidateName.toLowerCase();
-          if (lower.contains('polar') && lower.contains('h10')) {
-            if (!completer.isCompleted) {
-              completer.complete(result);
-            }
-            break;
-          }
-        }
-      });
-
-      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 10));
-      final found = await completer.future.timeout(const Duration(seconds: 12));
-      await FlutterBluePlus.stopScan();
-
-      final device = found.device;
-      final advName = found.advertisementData.advName;
-      final deviceName = advName.isNotEmpty
-          ? advName
-          : (device.platformName.isNotEmpty
-                ? device.platformName
-                : 'Polar H10');
-
-      _deviceConnectionSub?.cancel();
-      _deviceConnectionSub = device.connectionState.listen((state) {
-        if (!mounted) return;
-        if (state == BluetoothConnectionState.disconnected) {
-          setState(() {
-            _isPolarConnected = false;
-            _isPolarConnecting = false;
-            _heartRate = 0;
-            _rrIntervalMs = 0;
-            _status = 'Sensor Bluetooth terputus';
-          });
-        }
-      });
-
-      try {
-        await device.connect(timeout: const Duration(seconds: 15));
-      } catch (e) {
-        final msg = e.toString().toLowerCase();
-        final alreadyConnected =
-            msg.contains('already connected') ||
-            msg.contains('connection already exists');
-        if (!alreadyConnected) rethrow;
-      }
-
-      final services = await device.discoverServices();
-
-      BluetoothCharacteristic? hrChar;
-      for (final service in services) {
-        final serviceId = service.uuid.toString().toLowerCase();
-        if (serviceId.contains(_heartRateServiceUuid)) {
-          for (final characteristic in service.characteristics) {
-            final charId = characteristic.uuid.toString().toLowerCase();
-            if (charId.contains(_heartRateMeasurementUuid)) {
-              hrChar = characteristic;
-              break;
-            }
-          }
-        }
-        if (hrChar != null) break;
-      }
-
-      if (hrChar == null) {
-        throw Exception(
-          'Characteristic Heart Rate Measurement tidak ditemukan',
-        );
-      }
-
-      _hrValueSub?.cancel();
-      _hrCharacteristic = hrChar;
-      _hrValueSub = hrChar.lastValueStream.listen(
-        _onHeartRatePacket,
-        onError: (error) {
-          if (!mounted) return;
-          setState(() {
-            _status = 'Gagal menerima heart rate: $error';
-          });
-        },
-      );
-
-      await hrChar.setNotifyValue(true);
-
-      if (!mounted) return;
-      setState(() {
-        _polarDevice = device;
-        _sensorName = deviceName;
-        _isPolarConnecting = false;
-        _isPolarConnected = true;
-        _status = 'Sensor terhubung: $deviceName';
-      });
-    } on TimeoutException {
-      if (!mounted) return;
-      setState(() {
-        _isPolarConnecting = false;
-        _isPolarConnected = false;
-        _status = 'Polar H10 tidak ditemukan';
-      });
-      await _showSensorNotFoundBottomSheet();
+      await _polarChannel.invokeMethod('startScanAndConnect');
     } catch (e) {
+      _dismissScanningBottomSheet();
       if (!mounted) return;
       setState(() {
         _isPolarConnecting = false;
         _isPolarConnected = false;
-        _status = 'Gagal menghubungkan sensor: $e';
+        _status = 'Gagal memulai Polar SDK: $e';
       });
     } finally {
-      await FlutterBluePlus.stopScan();
       await _scanResultsSub?.cancel();
       _scanResultsSub = null;
-      _dismissScanningBottomSheet();
-    }
-  }
-
-  void _onHeartRatePacket(List<int> value) {
-    if (value.length < 2) return;
-
-    final flags = value[0];
-    final is16BitHr = (flags & 0x01) != 0;
-    final hasEnergyExpended = (flags & 0x08) != 0;
-    final hasRrInterval = (flags & 0x10) != 0;
-
-    int index = 1;
-    int hr;
-
-    if (is16BitHr) {
-      if (value.length < 3) return;
-      hr = value[1] | (value[2] << 8);
-      index = 3;
-    } else {
-      hr = value[1];
-      index = 2;
-    }
-
-    if (hasEnergyExpended) {
-      index += 2;
-    }
-
-    int rrMs = 0;
-    if (hasRrInterval && value.length >= index + 2) {
-      final rrRaw = value[index] | (value[index + 1] << 8);
-      rrMs = (rrRaw * 1000 / 1024).round();
-    }
-
-    final effectiveRrMs = rrMs > 0 ? rrMs : _rrIntervalMs;
-
-    if (_isRunning && !_isSimulationMode) {
-      _signalBuffer.removeAt(0);
-      _signalBuffer.add(hr.toDouble());
-      if (!_isCalibrating) {
-        _hrPacketCount++;
-        _beatsProcessed = _hrPacketCount;
-        _detectedRPeaks = _hrPacketCount;
-      }
-    }
-
-    final fallbackClass = _classifyLiveBeat(hr: hr, rrMs: effectiveRrMs);
-
-    if (!mounted) return;
-    setState(() {
-      _heartRate = hr;
-      if (effectiveRrMs > 0) {
-        _rrIntervalMs = effectiveRrMs;
-      }
-
-      if (_isRunning && !_isSimulationMode && !_isCalibrating) {
-        _status = _isBluetoothInferenceBusy
-            ? 'Bluetooth aktif - Menyelesaikan inferensi sebelumnya'
-            : 'Bluetooth aktif - Menjalankan inferensi model';
-      } else {
-        _status = _isCalibrating
-            ? 'Stabilisasi sinyal Bluetooth... $_calibrationSecondsLeft detik'
-            : 'Sensor terhubung: $_sensorName';
-      }
-    });
-
-    if (_isRunning && !_isSimulationMode && !_isCalibrating) {
-      unawaited(
-        _runBluetoothInference(
-          hr: hr,
-          rrMs: effectiveRrMs,
-          fallbackClass: fallbackClass,
-        ),
-      );
     }
   }
 
   Future<void> _disconnectPolarSensor({bool resetMode = true}) async {
+    try {
+      await _polarChannel.invokeMethod('disconnect');
+    } catch (_) {}
+
     try {
       await _hrCharacteristic?.setNotifyValue(false);
     } catch (_) {}
@@ -913,8 +979,9 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     setState(() {
       _isPolarConnected = false;
       _isPolarConnecting = false;
-      _heartRate = 0;
-      _rrIntervalMs = 0;
+      _ecgSamplesReceived = 0;
+      _polarEcgSampleRate = 130;
+      _estimatedBpm = 0;
       _isBluetoothInferenceBusy = false;
       _chartBeatFrames = [];
       _sensorName = '—';
@@ -1298,13 +1365,13 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
 
   void _resetSessionState() {
     for (int i = 0; i < _signalBuffer.length; i++) {
-      _signalBuffer[i] = _isSimulationMode
-          ? 0.0
-          : (_heartRate > 0 ? _heartRate.toDouble() : 0.0);
+      _signalBuffer[i] = 0.0;
     }
 
     if (_isSimulationMode && _evaluationRows.isNotEmpty) {
       _loadRowIntoSignalBuffer(_evaluationRows.first);
+    } else {
+      _ecgSamplesReceived = 0;
     }
 
     _lastFilteredLive = 0.0;
@@ -1313,6 +1380,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     _liveSampleIndex = 0;
     _lastPeakIndex = -1000;
     _recentPeakIndices.clear();
+    _estimatedBpm = 0;
 
     setState(() {
       _isRunning = true;
@@ -1321,14 +1389,13 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       _tick = 0;
       _sessionSeconds = 0;
       _duration = '00:00';
-      _hrPacketCount = 0;
       _isBluetoothInferenceBusy = false;
 
       _lastPredictionClass = '—';
       _lastPredictionShort = '—';
       _predictionConfidence = 0.0;
       _lastInferenceMs = 0.0;
-      _lastCpuAtInference = 0.0;
+      _lastCpuAtInference = -1.0;
       _chartBeatFrames = [];
       _currentGroundTruthShort = '—';
       _currentGroundTruthLong = '—';
@@ -1345,9 +1412,9 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       _ramMinMb = 0;
       _ramMaxMb = 0;
 
-      _cpuCurrent = 0;
-      _cpuMin = 0;
-      _cpuMax = 0;
+      _cpuCurrent = -1.0;
+      _cpuMin = -1.0;
+      _cpuMax = -1.0;
 
       _throughput = 0;
       _totalInferenceRuns = 0;
@@ -1510,7 +1577,8 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
                     'Sensor',
                     _isPolarConnected ? _sensorName : 'Belum tersambung',
                   ),
-                  _SummaryLine('Data sensor', _bluetoothReferenceLabel),
+                  _SummaryLine('Sampel ECG diterima', '$_ecgSamplesReceived'),
+                  _SummaryLine('Sampling rate ECG', '$_polarEcgSampleRate Hz'),
                   _SummaryLine(
                     'Distribusi dominan sesi',
                     _dominantClassFromCounts(_classCounts),
@@ -1642,13 +1710,11 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       final rawInput = [
         row.raw.map((v) => [v]).toList(),
       ];
-      final morphInput = [row.morph];
+      final output = List.generate(1, (_) => List.filled(5, 0.0));
 
-      final inputs = [rawInput, morphInput];
-      final output = {0: List.generate(1, (_) => List.filled(5, 0.0))};
-
+      await _sampleCpuUsageSafe();
       final sw = Stopwatch()..start();
-      _interpreter!.runForMultipleInputs(inputs, output);
+      _interpreter!.run(rawInput, output);
       sw.stop();
 
       final latencyMs = sw.elapsedMicroseconds / 1000.0;
@@ -1657,16 +1723,16 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       _updateMemoryStats();
       final cpuAtInference = await _sampleCpuUsageSafe();
 
-      final probs = (output[0] as List<List<double>>)[0];
+      final probs = output[0];
       int bestIdx = 0;
       for (int i = 1; i < probs.length; i++) {
         if (probs[i] > probs[bestIdx]) bestIdx = i;
       }
 
-      final predictedClass = _classNames[bestIdx];
-      final predictedShort = _classShort[predictedClass] ?? '—';
+      final predictedShort = _modelClassShort[bestIdx];
+      final predictedClass = _shortToLong[predictedShort] ?? 'Unknown';
       final confidence = probs[bestIdx].clamp(0.0, 1.0);
-      final isCorrect = predictedClass == row.gtClassName;
+      final isCorrect = predictedShort == row.gtClassShort;
 
       _totalInferenceRuns++;
       _evalTotal++;
@@ -1717,8 +1783,6 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
   }
 
   Future<void> _runBluetoothInference({
-    required int hr,
-    required int rrMs,
     required Map<String, String> fallbackClass,
   }) async {
     if (_interpreter == null ||
@@ -1729,24 +1793,28 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       return;
     }
 
+    if (_ecgSamplesReceived < _modelWindowSamples) {
+      if (mounted) {
+        setState(() {
+          _status = 'Bluetooth aktif - Menunggu buffer ECG cukup';
+        });
+      }
+      return;
+    }
+
     _isBluetoothInferenceBusy = true;
 
     try {
       final rawWindow = _buildLiveRawWindow();
-      final morph = _buildLiveMorphFeatures(
-        rawWindow: rawWindow,
-        hr: hr,
-        rrMs: rrMs,
-      );
 
       final rawInput = [
         rawWindow.map((v) => [v]).toList(),
       ];
-      final morphInput = [morph];
-      final output = {0: List.generate(1, (_) => List.filled(5, 0.0))};
+      final output = List.generate(1, (_) => List.filled(5, 0.0));
 
+      await _sampleCpuUsageSafe();
       final sw = Stopwatch()..start();
-      _interpreter!.runForMultipleInputs([rawInput, morphInput], output);
+      _interpreter!.run(rawInput, output);
       sw.stop();
 
       final latencyMs = sw.elapsedMicroseconds / 1000.0;
@@ -1755,15 +1823,14 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       _updateMemoryStats();
       final cpuAtInference = await _sampleCpuUsageSafe();
 
-      final probs = (output[0] as List<List<double>>)[0];
+      final probs = output[0];
       int bestIdx = 0;
       for (int i = 1; i < probs.length; i++) {
         if (probs[i] > probs[bestIdx]) bestIdx = i;
       }
 
-      final predictedClass = _classNames[bestIdx];
-      final predictedShort =
-          _classShort[predictedClass] ?? fallbackClass['short']!;
+      final predictedShort = _modelClassShort[bestIdx];
+      final predictedClass = _shortToLong[predictedShort] ?? 'Unknown';
       final confidence = probs[bestIdx].clamp(0.0, 1.0);
 
       _totalInferenceRuns++;
@@ -1774,9 +1841,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
 
       if (!mounted) return;
       setState(() {
-        _pushChartBeatFrame(
-          _buildSyntheticChartBeatFrame(shortClass: predictedShort, rrMs: rrMs),
-        );
+        _pushChartBeatFrame(_buildLiveChartBeatFrame(predictedShort));
         _lastPredictionClass = predictedClass;
         _lastPredictionShort = predictedShort;
         _predictionConfidence = confidence;
@@ -1804,9 +1869,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
 
       if (!mounted) return;
       setState(() {
-        _pushChartBeatFrame(
-          _buildSyntheticChartBeatFrame(shortClass: predictedShort, rrMs: rrMs),
-        );
+        _pushChartBeatFrame(_buildLiveChartBeatFrame(predictedShort));
         _lastPredictionClass = predictedClass;
         _lastPredictionShort = predictedShort;
         _predictionConfidence = 0.0;
@@ -1850,7 +1913,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     required bool isBluetoothMode,
   }) {
     if (isBluetoothMode) {
-      return 'Mode Bluetooth memakai sinyal live sensor tanpa label referensi. Hasil ini menampilkan prediksi model TFLite, waktu inferensi, dan CPU berdasarkan buffer sinyal live dari paket HR/RR sensor.';
+      return 'Mode Bluetooth memakai sinyal live sensor tanpa label referensi. Hasil ini menampilkan prediksi model TFLite 130 Hz, waktu inferensi, dan CPU/RAM berdasarkan buffer sinyal live.';
     }
 
     return switch (predictedShort) {
@@ -1867,44 +1930,6 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       _ =>
         'Model telah menghasilkan prediksi, tetapi penjelasan kelas belum tersedia.',
     };
-  }
-
-  Map<String, String> _classifyLiveBeat({required int hr, required int rrMs}) {
-    if (hr <= 0) {
-      return const {'short': '—', 'full': 'Menunggu data'};
-    }
-
-    if (rrMs > 0) {
-      if (rrMs < 460 || hr >= 135) {
-        return const {'short': 'V', 'full': 'VEB'};
-      }
-      if (rrMs < 650 || hr >= 110) {
-        return const {'short': 'S', 'full': 'SVEB'};
-      }
-      if (rrMs > 1300 || hr < 45) {
-        return const {'short': 'Q', 'full': 'Unknown'};
-      }
-      if (rrMs >= 900 && rrMs <= 1150 && hr >= 55 && hr <= 100) {
-        return const {'short': 'N', 'full': 'Normal'};
-      }
-      if (rrMs >= 650 && rrMs < 900) {
-        return const {'short': 'F', 'full': 'Fusion'};
-      }
-    }
-
-    if (hr >= 55 && hr <= 100) {
-      return const {'short': 'N', 'full': 'Normal'};
-    }
-    if (hr > 100 && hr <= 120) {
-      return const {'short': 'S', 'full': 'SVEB'};
-    }
-    if (hr > 120) {
-      return const {'short': 'V', 'full': 'VEB'};
-    }
-    if (hr < 45) {
-      return const {'short': 'Q', 'full': 'Unknown'};
-    }
-    return const {'short': 'F', 'full': 'Fusion'};
   }
 
   void _updateLatencyStats() {
@@ -1933,7 +1958,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
   void _updateCpuStats(double cpu) {
     if (!_isValidCpuUsage(cpu)) return;
     _cpuCurrent = cpu;
-    if (_cpuMin == 0 || cpu < _cpuMin) _cpuMin = cpu;
+    if (!_isValidCpuUsage(_cpuMin) || cpu < _cpuMin) _cpuMin = cpu;
     if (cpu > _cpuMax) _cpuMax = cpu;
   }
 
@@ -1946,153 +1971,9 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       window.insert(0, window.isEmpty ? 0.0 : window.first);
     }
 
-    final mean = window.reduce((a, b) => a + b) / window.length;
-    final variance =
-        window.map((v) => pow(v - mean, 2).toDouble()).reduce((a, b) => a + b) /
-        window.length;
-    final std = sqrt(variance);
-    final scale = std < 1e-6 ? 1.0 : std;
-
-    return [for (final value in window) (value - mean) / scale];
-  }
-
-  List<double> _buildLiveMorphFeatures({
-    required List<double> rawWindow,
-    required int hr,
-    required int rrMs,
-  }) {
-    final sorted = List<double>.from(rawWindow)..sort();
-    final diffs = <double>[
-      for (int i = 1; i < rawWindow.length; i++)
-        rawWindow[i] - rawWindow[i - 1],
-    ];
-    final mean = rawWindow.reduce((a, b) => a + b) / rawWindow.length;
-    final variance =
-        rawWindow
-            .map((v) => pow(v - mean, 2).toDouble())
-            .reduce((a, b) => a + b) /
-        rawWindow.length;
-    final std = sqrt(variance);
-    final minVal = sorted.first;
-    final maxVal = sorted.last;
-    final range = maxVal - minVal;
-    final median = sorted[sorted.length ~/ 2];
-    final p10 = sorted[((sorted.length - 1) * 0.10).round()];
-    final p25 = sorted[((sorted.length - 1) * 0.25).round()];
-    final p75 = sorted[((sorted.length - 1) * 0.75).round()];
-    final p90 = sorted[((sorted.length - 1) * 0.90).round()];
-    final rms = sqrt(
-      rawWindow.map((v) => v * v).reduce((a, b) => a + b) / rawWindow.length,
-    );
-    final meanAbs =
-        rawWindow.map((v) => v.abs()).reduce((a, b) => a + b) /
-        rawWindow.length;
-    final energy =
-        rawWindow.map((v) => v * v).reduce((a, b) => a + b) / rawWindow.length;
-    final diffMean = diffs.reduce((a, b) => a + b) / diffs.length;
-    final diffVariance =
-        diffs
-            .map((v) => pow(v - diffMean, 2).toDouble())
-            .reduce((a, b) => a + b) /
-        diffs.length;
-    final diffStd = sqrt(diffVariance);
-    final diffAbsMean =
-        diffs.map((v) => v.abs()).reduce((a, b) => a + b) / diffs.length;
-
-    int zeroCrossings = 0;
-    for (int i = 1; i < diffs.length; i++) {
-      final previous = diffs[i - 1];
-      final current = diffs[i];
-      if ((previous <= 0 && current > 0) || (previous >= 0 && current < 0)) {
-        zeroCrossings++;
-      }
-    }
-
-    int peakCount = 0;
-    int troughCount = 0;
-    for (int i = 1; i < rawWindow.length - 1; i++) {
-      if (rawWindow[i] > rawWindow[i - 1] && rawWindow[i] > rawWindow[i + 1]) {
-        peakCount++;
-      }
-      if (rawWindow[i] < rawWindow[i - 1] && rawWindow[i] < rawWindow[i + 1]) {
-        troughCount++;
-      }
-    }
-
-    final half = rawWindow.length ~/ 2;
-    final left = rawWindow.sublist(0, half);
-    final right = rawWindow.sublist(half);
-    final leftMean = left.reduce((a, b) => a + b) / left.length;
-    final rightMean = right.reduce((a, b) => a + b) / right.length;
-    final centerStart = max(0, half - 5);
-    final centerEnd = min(rawWindow.length, half + 5);
-    final centerSlice = rawWindow.sublist(centerStart, centerEnd);
-    final centerMean = centerSlice.reduce((a, b) => a + b) / centerSlice.length;
-    final lag1 = _autocorrelation(rawWindow, 1);
-    final lag2 = _autocorrelation(rawWindow, 2);
-    final slope = (rawWindow.last - rawWindow.first) / (rawWindow.length - 1);
-    final positiveRatio =
-        rawWindow.where((v) => v > 0).length / rawWindow.length;
-    final consistency = rrMs > 0 ? ((hr * rrMs) / 60000.0) : 0.0;
-
-    return [
-      mean,
-      std,
-      minVal,
-      maxVal,
-      range,
-      median,
-      p10,
-      p25,
-      p75,
-      p90,
-      rms,
-      meanAbs,
-      energy,
-      diffMean,
-      diffStd,
-      diffAbsMean,
-      diffs.reduce(min),
-      diffs.reduce(max),
-      zeroCrossings / diffs.length,
-      positiveRatio,
-      peakCount / rawWindow.length,
-      troughCount / rawWindow.length,
-      rawWindow.first,
-      rawWindow[half],
-      rawWindow.last,
-      leftMean,
-      rightMean,
-      rightMean - leftMean,
-      lag1,
-      lag2,
-      slope,
-      hr / 200.0,
-      rrMs / 2000.0,
-      consistency,
-      centerMean,
-      rawWindow.map((v) => v.abs()).reduce(max),
-      variance,
-    ];
-  }
-
-  double _autocorrelation(List<double> values, int lag) {
-    if (lag <= 0 || lag >= values.length) return 0.0;
-
-    final mean = values.reduce((a, b) => a + b) / values.length;
-    double numerator = 0.0;
-    double denominator = 0.0;
-
-    for (int i = 0; i < values.length; i++) {
-      final centered = values[i] - mean;
-      denominator += centered * centered;
-      if (i + lag < values.length) {
-        numerator += centered * (values[i + lag] - mean);
-      }
-    }
-
-    if (denominator == 0.0) return 0.0;
-    return numerator / denominator;
+    // TODO: improve Bluetooth inference by detecting R-peak and centering
+    // the window using 39 pre-R + 81 post-R samples.
+    return window;
   }
 
   void _pushChartBeatFrame(ChartBeatFrame frame) {
@@ -2115,80 +1996,12 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     );
   }
 
-  ChartBeatFrame _buildSyntheticChartBeatFrame({
-    required String shortClass,
-    int rrMs = 0,
-  }) {
-    final sampleCount = (rrMs > 0 ? (rrMs / 14).round() : _chartBeatSamples)
-        .clamp(72, 112);
-    final profile = switch (shortClass) {
-      'S' => {
-        'pAmp': 0.17,
-        'qAmp': -0.12,
-        'rAmp': 0.92,
-        'sAmp': -0.26,
-        'tAmp': 0.28,
-        'rSigma': 0.015,
-        'tCenter': 0.72,
-      },
-      'V' => {
-        'pAmp': 0.06,
-        'qAmp': -0.08,
-        'rAmp': 1.18,
-        'sAmp': -0.48,
-        'tAmp': 0.16,
-        'rSigma': 0.024,
-        'tCenter': 0.76,
-      },
-      'F' => {
-        'pAmp': 0.12,
-        'qAmp': -0.10,
-        'rAmp': 0.88,
-        'sAmp': -0.24,
-        'tAmp': 0.24,
-        'rSigma': 0.018,
-        'tCenter': 0.73,
-      },
-      'Q' => {
-        'pAmp': 0.09,
-        'qAmp': -0.08,
-        'rAmp': 0.72,
-        'sAmp': -0.20,
-        'tAmp': 0.18,
-        'rSigma': 0.017,
-        'tCenter': 0.74,
-      },
-      _ => {
-        'pAmp': 0.14,
-        'qAmp': -0.12,
-        'rAmp': 1.00,
-        'sAmp': -0.30,
-        'tAmp': 0.32,
-        'rSigma': 0.014,
-        'tCenter': 0.73,
-      },
-    };
-
-    double gaussian(double x, double center, double sigma, double amplitude) {
-      final variance = sigma * sigma * 2;
-      return amplitude * exp(-pow(x - center, 2) / variance);
-    }
-
-    final samples = List<double>.generate(sampleCount, (i) {
-      final x = i / (sampleCount - 1);
-      final baseline = 0.01 * sin(x * pi * 2.2);
-      return baseline +
-          gaussian(x, 0.18, 0.045, profile['pAmp']!) +
-          gaussian(x, 0.37, 0.014, profile['qAmp']!) +
-          gaussian(x, 0.40, profile['rSigma']!, profile['rAmp']!) +
-          gaussian(x, 0.435, 0.016, profile['sAmp']!) +
-          gaussian(x, profile['tCenter']!, 0.085, profile['tAmp']!);
-    });
-
-    final normalized = _normalizeEcgSamples(samples);
+  ChartBeatFrame _buildLiveChartBeatFrame(String shortClass) {
+    final normalized = _normalizeEcgSamples(_buildLiveRawWindow());
+    final samples = _resampleSignal(normalized, _chartBeatSamples);
     return ChartBeatFrame(
-      samples: normalized,
-      rPeakIndex: _findRPeakIndex(normalized),
+      samples: samples,
+      rPeakIndex: _findRPeakIndex(samples),
       shortClass: shortClass,
     );
   }
@@ -2253,10 +2066,9 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     }
 
     if (!_isSimulationMode && _lastPredictionShort != '—') {
-      return _buildSyntheticChartBeatFrame(
-        shortClass: _lastPredictionShort,
-        rrMs: _rrIntervalMs,
-      );
+      if (_ecgSamplesReceived >= _modelWindowSamples) {
+        return _buildLiveChartBeatFrame(_lastPredictionShort);
+      }
     }
 
     return null;
@@ -2380,10 +2192,8 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       return '—';
     }
 
-    final hrText = _heartRate > 0 ? 'HR $_heartRate bpm' : 'HR —';
-    final rrText = _rrIntervalMs > 0 ? 'RR $_rrIntervalMs ms' : 'RR —';
     final liveDominant = _dominantClassFromCounts(_classCounts);
-    return '$hrText · $rrText · Distribusi dominan sesi $liveDominant';
+    return 'ECG $_polarEcgSampleRate Hz · $_ecgSamplesReceived sampel · Distribusi dominan sesi $liveDominant';
   }
 
   String get _modeLabel {
@@ -2517,6 +2327,7 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
     _scanResultsSub?.cancel();
     _deviceConnectionSub?.cancel();
     _hrValueSub?.cancel();
+    _polarEventSub?.cancel();
 
     _pulseCtrl.dispose();
     _interpreter?.close();
@@ -2802,13 +2613,13 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
         ? _predictionBorderAccent(_lastPredictionShort)
         : T.blueBrd;
 
-    final leftLabel = _isSimulationMode ? 'Sampel diproses' : 'Detak jantung';
+    final leftLabel = _isSimulationMode ? 'Sampel diproses' : 'Heart Rate';
     final leftValue = _isSimulationMode
         ? '$_evalTotal'
-        : (_heartRate > 0 ? '$_heartRate' : '—');
+        : (_estimatedBpm > 0 ? '$_estimatedBpm' : 'â€”');
     final leftFooter = _isSimulationMode
         ? '/ ${_evaluationRows.length}'
-        : 'detak / menit';
+        : (_estimatedBpm > 0 ? 'Beat Per Minute' : 'menunggu ECG');
     final leftColor = _isSimulationMode ? T.green : T.red;
 
     final rightLabel = _isSimulationMode
@@ -3065,10 +2876,10 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       );
     }
 
-    final leftLabel = 'Paket HR';
-    final rightLabel = 'RR interval';
-    final leftValue = '$_hrPacketCount';
-    final rightValue = _rrIntervalMs > 0 ? '$_rrIntervalMs ms' : '—';
+    final leftLabel = 'Sampel ECG';
+    final rightLabel = 'Sampling rate';
+    final leftValue = '$_ecgSamplesReceived';
+    final rightValue = '$_polarEcgSampleRate Hz';
 
     return _Panel(
       child: Column(
@@ -3251,12 +3062,17 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
       }
     } else {
       debugChildren.add(
-        _Chip(label: 'HR $_heartRate bpm', active: _heartRate > 0),
+        _Chip(
+          label: 'ECG $_ecgSamplesReceived sampel',
+          active: _ecgSamplesReceived > 0,
+        ),
       );
       debugChildren.add(
-        _Chip(label: 'RR $_rrIntervalMs ms', active: _rrIntervalMs > 0),
+        _Chip(
+          label: '$_polarEcgSampleRate Hz',
+          active: _ecgSamplesReceived > 0,
+        ),
       );
-      debugChildren.add(_Chip(label: 'Pkt $_hrPacketCount', active: true));
       if (_lastPredictionShort != '—') {
         debugChildren.add(
           _Chip(label: 'Kls $_lastPredictionShort', active: true),
@@ -3337,6 +3153,10 @@ class _EcgDashboardPageState extends State<EcgDashboardPage>
           ),
           _MetricRow('CPU minimum', _formatCpuValue(_cpuMin)),
           _MetricRow('CPU maksimum', _formatCpuValue(_cpuMax)),
+          if (!_isSimulationMode) ...[
+            _MetricRow('Sampel ECG diterima', '$_ecgSamplesReceived'),
+            _MetricRow('Sampling rate ECG', '$_polarEcgSampleRate Hz'),
+          ],
           _MetricRow(
             'Sensor',
             _isPolarConnected ? _sensorName : 'Tidak terdeteksi',

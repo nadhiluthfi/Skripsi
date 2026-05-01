@@ -11,15 +11,17 @@ android {
 
     defaultConfig {
         applicationId = "com.example.skripsi"
-        minSdk = flutter.minSdkVersion
+        minSdk = 33
         targetSdk = 36
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        missingDimensionStrategy("library", "sdk")
     }
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+        isCoreLibraryDesugaringEnabled = true
     }
 
     kotlinOptions {
@@ -35,4 +37,10 @@ android {
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    implementation(project(":polar_sdk"))
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
 }
